@@ -109,11 +109,11 @@ def build_rle_stream(frames_wire):
                 starts = np.concatenate(([0], breaks))
                 ends = np.concatenate((breaks, [len(line)]))
                 for s, e in zip(starts, ends):
-                    hi, lo = line[s]
+                    px = line[s].tobytes()          # bpp payload bytes
                     L = e - s
                     while L > 0:
                         c = min(L, 256)
-                        stream += bytes((c - 1, hi, lo))
+                        stream += bytes((c - 1,)) + px
                         L -= c
     print(f"step4+5: {n} frames = {n*2} fields, RLE stream "
           f"{len(stream)/1e6:.2f} MB")

@@ -1,0 +1,40 @@
+MSP3520 video player v3 (RGB666) - flashable firmware
+ESP32-S3 (esp32s3) - ESP-IDF v6.1 - 2026-11-14
+This fixes the v2 blank screen. Root cause: the ILI9488 does NOT support
+16-bit RGB565 (COLMOD 0x55) on its native 4-wire SPI interface - it is
+18-bit (0x66) only there. v3 is back to RGB666, now runtime-selectable.
+
+FILES
+  bootloader.bin                 flash at 0x0
+  partition-table.bin            flash at 0x8000
+  msp3520_video_oc_test.bin      flash at 0x10000  (7.9 MB - video inside)
+  msp3520_video_oc_test_full.bin all three merged - flash at 0x0 (easiest)
+
+FLASH (adjust COM port; no extra esptool flags needed):
+  C:\Espressif\tools\python\v6.1\venv\Scripts\python.exe -m esptool --chip esp32s3 -p COM10 -b 460800 --before default-reset --after hard-reset write-flash 0x0 msp3520_video_oc_test_full.bin
+
+WHAT TO EXPECT (clock reality: the S3 maps 35-60 MHz requests to 40 MHz,
+65-80 MHz requests to 80 MHz - no other steps exist):
+  - boot: dark blue fill screen, banner, ID line, then the sweep
+  - steps 10-30 MHz: lower fps, clean picture
+  - steps 35-60 MHz (all = 40 MHz actual): the video at ~10 fps - this is
+    the RGB666 bus ceiling (10.8 fps theoretical)
+  - steps 65-80 MHz (all = 80 MHz actual): if the picture is clean here,
+    you get ~20 fps. On your wiring these were corrupt before - see below.
+
+THE 80 MHz EXPERIMENT (the only path to 15+ fps on this panel):
+  Corruption at 80 MHz is often supply/signal-integrity, not the panel:
+  1. Power the module from 5V (its onboard LDO then regulates properly;
+     running VCC at 3.3V with J1 open starves the rail to ~3.1V)
+  2. Shorten SCK/MOSI jumpers (<10 cm), add a ground return wire alongside
+  3. Use the firmware's retest loop: after the sweep, enter 70, 75, 80
+  If 80 MHz comes clean: ~20 fps fullscreen (RGB666 ceiling 20.7).
+  24 fps is physically impossible on ILI9488 over SPI (needs 88.5 Mbps;
+  the S3 maxes out at 80 MHz = 20.7 fps at RGB666).
+
+IF COLORS LOOK WRONG: red/blue swapped -> LCD_MADCTL 0x28 -> 0x20 in
+main/msp3520.h and rebuild. Upside-down -> 0xE8. (v1/v3 both use 0x28 and
+were hardware-verified, so this should not be needed.)
+
+WIRING (unchanged): CS GPIO10, DC GPIO9, RESET GPIO14, MOSI GPIO11,
+SCK GPIO12, backlight GPIO47, VCC 3.3V (or 5V), GND.

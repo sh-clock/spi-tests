@@ -40,11 +40,11 @@ int main(int argc, char **argv)
             fprintf(stderr, "decode ended early at line %u of %u\n", i, total_lines);
             break;
         }
-        fwrite(line, 1, VIDEO_LINE_BYTES, o);
+        fwrite(line, 1, (size_t)(480 * h->bpp), o);
         ok_lines++;
     }
     fclose(o);
     printf("decoded %u/%u lines (%u bytes)\n",
-           ok_lines, total_lines, ok_lines * VIDEO_LINE_BYTES);
+           ok_lines, total_lines, (unsigned)(ok_lines * 480 * h->bpp));
     return ok_lines == total_lines ? 0 : 1;
 }

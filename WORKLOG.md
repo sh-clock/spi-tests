@@ -2,7 +2,7 @@
 
 Repo: sh-clock/spi-tests (GPL-3.0). Target: fullscreen 480x320 video, **24 fps** target,
 **15 fps** hard minimum (source video rate), on ESP32-S3 + MSP3520 module.
-Safe SPI limit per owner's sweep: "60 MHz" (see §2 — this is actually 40 MHz).
+Reliable SPI clock per owner's sweep: "60 MHz" requested — see §2.1 (this is 40 MHz actual).
 
 ## COMMANDMENTS (from the owner, embedded so they are never forgotten)
 
@@ -23,123 +23,189 @@ Safe SPI limit per owner's sweep: "60 MHz" (see §2 — this is actually 40 MHz)
 
 ## 1. Current state
 
-- `firmware/msp3520-video-oc-test` — v1 player (RGB666/3B-px, LZSS+RLE "MIV1" blob,
-  interlaced fields, per-line DMA queue, MADCTL landscape fix verified). Known good
-  on hardware (owner confirmed video displays, orientation fixed).
-- v2 (this branch of work): **RGB565/2B-px wire format** + real-clock logging +
-  deeper DMA pipeline. Status: IN PROGRESS (see §5).
+- **v3 (current)**: runtime-selectable wire pixel format (`msp3520_set_wire_bpp`),
+  **RGB666 / COLMOD 0x66 default** (the only format this panel accepts on SPI —
+  see §8), bpp-driven blob decoder ("MIV2" header, bpp 2 or 3), converter `--bpp`
+  flag (default 3). The player sets the wire format from the blob header.
+- v2 (commit 794cdb4): RGB565/0x55 — **BROKEN ON THIS PANEL: blank screen**.
+  Root cause in §8. Kept in history as the cautionary tale.
+- v1 (commit 0a5b4ba): RGB666, fixed geometry — hardware-verified working.
 
-## 2. Research findings (verified, sources cited)
+## 2. Verified facts (sources cited)
 
-1. **"60 MHz" does not exist on ESP32-S3 GPSPI.** The SPI master clock derives from
-   an 80 MHz source with integer dividers; requests map as: 35–60 MHz → **40 MHz**,
-   65–80 MHz → **80 MHz** (ESP-IDF `spi_ll_master_cal_clock`; TRM §30.7).
-   Consequence: the owner's sweep result "clean up to 60, corrupt above" means
-   **40 MHz clean, 80 MHz corrupt** on the current wiring. All fps math must use
-   5 MB/s (40 MHz) not 7.5 MB/s. Fix under test: print the *actual* clock via
-   `spi_device_get_actual_freq()`; try 5V supply + short wires to unlock 80 MHz.
-   Sources: docs.espressif.com .../peripherals/spi_master.html; S3 TRM v1.8 §30.7.
+1. **"60 MHz" does not exist on ESP32-S3 GPSPI.** Integer dividers from 80 MHz:
+   requests 35–60 MHz → **40 MHz**, 65–80 MHz → **80 MHz**. The owner's sweep
+   result "clean to 60, corrupt above" = 40 MHz clean / 80 MHz corrupt.
+   Sources: docs.espressif.com .../peripherals/spi_master.html; S3 TRM §30.7.
 2. **LovyanGFX forces 18bpp (RGB666) for ILI9488 over SPI**
-   (`Panel_ILI948x.hpp::setColorDepth_impl` — `rgb888_3Byte` whenever bus is SPI;
-   comment cites ILI9486 spec p.125). 18bpp caps fullscreen at 10.8 fps @40 MHz —
-   BELOW the 15 fps minimum. LovyanGFX (FreeBSD/BSD-2, GPL-3-compatible) is
-   therefore NOT used for the video path; our audited driver is. Its S3 SCT
-   (segmented DMA) benefit ≈ ESP-IDF's automatic descriptor chaining (99.8% bus
-   utilisation documented). Integration recipe kept in §6 for optional later use.
-3. **ILI9488 16bpp (COLMOD 0x55) over 4-wire SPI is datasheet-listed** (§4.7.2:
-   "65K-Colors, RGB 5,6,5 bits input data (set 3Ah as 101)") and is the shipping
-   default of Arduino_GFX for ILI9488 (`Arduino_ILI9488.cpp: writeC8D8(0x3A,0x55)`).
-   TFT_eSPI/LovyanGFX choose 0x66 for SPI (ILI9486-family caution). Evidence
-   supports 0x55 on ILI9488; hardware test will confirm (owner flashes).
-4. **ESP-IDF DMA facts**: per-transaction hardware cap 32 KB; driver auto-chains
-   4092-byte descriptors, CS held; polling-DMA overhead ~11 µs/transaction;
-   formula `n/(20+8n/F)` µs → large chained transfers reach ~99% of bus speed.
-   No S3 GPSPI errata. Source: spi_master docs + `dma_types.h`, `spi_ll.h`.
-5. **Fps arithmetic at 480x320** (100% bus):
-   | format | bytes/frame | @40 MHz | @80 MHz |
-   |---|---|---|---|
-   | RGB666 3B/px | 460,800 | 10.8 fps | 21.7 fps |
-   | **RGB565 2B/px** | **307,200** | **16.3 fps** | **32.6 fps** |
-   => 15 fps minimum needs 565 at 40 MHz (92% duty) — v1 (666) could NEVER reach
-   15 fps. 24 fps needs 80 MHz (or dirty-line skipping, see §6).
-6. Community scan: no public project demonstrates 24 fps software-decoded video at
-   480x320 on ESP32; raw-stream players (moononournation, MIT-incompatible repos —
-   techniques only, no code copied) hit 24–30 fps at 320x240 @80 MHz. Our
-   pre-compressed flash blob avoids both decode and storage bottlenecks.
+   (`Panel_ILI948x.hpp::setColorDepth_impl`, comment cites ILI9486 spec p.125).
+   FreeBSD/BSD-2 license, GPL-3-compatible. NOT used for the video path — no
+   benefit (bus-bound streaming) and it forces the same 18bpp we now use anyway.
+3. **ILI9488 16bpp (COLMOD 0x55) DOES NOT WORK on native 4-wire SPI** —
+   see §8 for the full evidence chain. (This CORRECTS this WORKLOG's v2-era
+   assessment, which relied on the datasheet bullet list and Arduino_GFX's
+   default class — both misleading: the datasheet lists 0x55 for DBI but
+   documents no 16-bit SPI data packing, and Arduino_GFX's plain ILI9488 class
+   is for PARALLEL buses; its SPI class is the 18-bit one.)
+4. **ESP-IDF DMA**: per-transaction hardware cap 32 KB; driver auto-chains
+   4092-byte descriptors, CS held; polling overhead ~11 µs/transaction;
+   large chained transfers reach ~99% of bus speed.
+5. **Fps physics at 480x320, RGB666 (0.46 MB/frame)**:
+   | bus | ceiling | verdict |
+   |---|---|---|
+   | 40 MHz (5 MB/s) | **10.8 fps** | v3 expectation ~10 |
+   | 80 MHz (10 MB/s) | **20.7 fps** | needs the 80 MHz experiment (§6) |
+   | 88.5+ Mbps | 24 fps | **physically impossible** — above the S3's max SPI bus |
+6. **Dirty-line skipping measured NOT worth it for this content**
+   (`tools/measure_dirty.py`, Hill video, 118 frame transitions): 5.1% of field
+   lines fully identical, 50.8% partial-span (wide spans), net wire saving
+   **5.7%** (436,511 vs 462,720 B/frame; best frame 0 B = loop point, worst
+   frame = full frame). Implied fps @40 MHz: 10.8 → 11.4. A "MIV3" skip format
+   would buy ~0.6 fps — rejected on evidence.
 
-## 3. v2 design (implemented in this repo)
+## 3. v3 design
 
-- Wire format: **RGB565, big-endian pixel, COLMOD 0x55**, MADCTL 0x28 (unchanged
-  geometry/color-order behavior; BGR bit semantics identical to verified v1).
-- Blob "MIV2": same LZSS(64K win)+per-line-RLE layers; RLE run = `[count-1][hi][lo]`;
-  header field `reserved` → `bpp` (=2). Decoder change is 6 lines; LZSS untouched.
-- `TX_LINES_IN_FLIGHT` stays 2: at 40 MHz the wire (192 µs/line) is the
-  bottleneck and the decoder outpaces it; 2 lines fully overlap decode/DMA
-  (16-slot ring, 8 used — audit-verified retire pattern).
-- The banner prints the S3 clock-mapping reality (35–60→40, 65–80→80 MHz);
-  full mapping documented in §2.1.
-- Fallback documented: if a panel rejects 0x55 (unlikely per §2.3), revert to v1
-  commit (this repo) or set COLMOD 0x66 + rebuild blob with `--bpp 3`.
+- Wire format: **RGB666, 3 bytes/pixel, COLMOD 0x66**, selected at runtime via
+  `msp3520_set_wire_bpp(2|3)`; the player calls it with `video_hdr()->bpp` so
+  the blob drives the format. `msp3520_reinit_panel()` re-asserts COLMOD after
+  each hardware reset (the sweep reinits per frequency).
+- Line buffers sized for the max format (1440 B); `msp3520_queue_line` sends
+  `480 * wire_bpp` bytes. `LCD_MAX_TRANSFER` covers the 666 line.
+- Blob "MIV2": header carries bpp (3 = RGB666 default, 2 = RGB565 for
+  parallel-interface modules); RLE runs = `[count-1] + bpp payload bytes`;
+  LZSS layer unchanged. Decoder accepts bpp 2 or 3.
+- Interlacing (even/odd fields) kept: halves per-update latency at the same
+  average throughput.
+- `TX_LINES_IN_FLIGHT` = 2 (bus-bound; decode outpaces the wire).
 
-## 4. Verification protocol (per commandments)
+## 4. Verification protocol (all must pass before shipping)
 
-- Host roundtrip: converter re-decodes LZSS+RLE and byte-compares ALL frames (python)
-  AND the real device `video.c` compiled with gcc must produce byte-identical
-  output (`tools/host_test_video.py`). This is the pixel-level guarantee.
-- Binary audit: byte-pattern check that built firmware contains MADCTL 0x28 init
-  entry and COLMOD 0x55.
-- Hardware (owner): flash, confirm colors/orientation, read measured fps at
-  40 MHz (expect ~14–16) and optionally 80 MHz after the 5V/short-wire test.
+1. Converter roundtrip: all frames byte-identical (in-script asserts).
+2. **Blob gate**: regenerated blob header must be `MIV2` with bpp=3 (a stale
+   565 blob once got past the old chain — see §9 incident 2).
+3. Host verify: gcc-compiled device `video.c` decodes the whole blob
+   byte-identical to the Python reference (`tools/host_test_video.py`).
+4. Binary byte-audit: init table contains MADCTL 0x28 + COLMOD 0x66 exactly
+   once; the v2 combo (0x28+0x55) and the portrait bug (0x48) must be absent.
+5. Hardware (owner): flash, confirm picture + fps at 40 MHz (~10 expected).
 
-RESULTS SO FAR (v2):
-- Converter roundtrip: all 119 frames byte-identical (in-script asserts, PASS).
-- Host verify of the DEVICE decoder: gcc-compiled main/video.c decoded all
-  38,080 lines = 36,556,800 bytes, sha256 43709f57a49cc8dc, byte-identical
-  to the Python reference expansion. PASS.
-- Audit agent (harsh, no-assumptions) found + we fixed: MADCTL 0x48
-  regression (a sandbox recycle had restored the pre-landscape-fix source),
-  a stale MIV1 blob in the repo tree, stale CMakeLists (`REQUIRES driver`),
-  and 5 comment/doc errors (field bits 1,228,800 & ~37 MHz, blob sizes,
-  MIV2 labels, "33% less"). Everything functional was verified clean.
+## 5. Status
 
-## 5. Status / next steps
+- [x] v2 root-caused (§8) — 0x55 unsupported on native-SPI ILI9488.
+- [x] v3 implemented: runtime wire-bpp, RGB666 default everywhere.
+- [x] Dirty-line compression evaluated on real content: rejected (5.7%).
+- [x] Harness bugs fixed (§9 incidents 1–2): bpp-generic RLE emission,
+  bpp-aware host-test line dump.
+- [x] RGB666 blob regenerated (7,636,014 B, MIV2 bpp=3) + converter
+      roundtrip PASS + blob-header gate PASS.
+- [x] Host verify PASS: device decoder byte-identical to the reference,
+      sha256 c9e275970e3fc83e (54,835,200 bytes = 238x160x1440).
+- [x] Pixel audit PASS: decoder frames 0/20/40/60/80/100 vs the source
+      (same pipeline) — max channel error 7 = exactly the RGB666
+      quantization bound; mean 2.88.
+- [x] VLM visual audit: initial "CORRUPT" verdict proven a FALSE POSITIVE —
+      the source video's opening frame is genuinely overexposed/washed-out
+      (a raw ffmpeg frame, bypassing our pipeline, gets the identical
+      description under a neutral prompt). Decode correctness stands on
+      the pixel audit.
+- [x] v3 firmware built (app 7,865,488 B, 6% free) + binary byte-audit
+      PASS (MADCTL 0x28 + COLMOD 0x66 present exactly once; the v2 0x55
+      combo and the portrait 0x48 bug both absent) + packaged
+      (firmware/msp3520-video-firmware-v3/ + download/ zips).
+- [ ] Owner hardware test: picture OK + ~10 fps @ 40 MHz.
+- [ ] 80 MHz stability experiment (§6) — the ONLY path to 15+ fps.
 
-- [x] Research (§2) — three parallel agents, sources cited above.
-- [x] Baseline v1 imported + this worklog.
-- [x] v2 implementation (§3) — RGB565/MIV2, all edits applied.
-- [x] Host verification (§4): converter roundtrip PASS + device-decoder
-      byte-identity PASS (sha256 43709f57a49cc8dc).
-- [x] Parallel audit agent on the v2 diff — 2 blockers + 5 minors found,
-      ALL fixed (see §4 results). Sandbox recycle had restored pre-fix
-      sources; re-applied MADCTL 0x28 + CMakeLists component split.
-- [x] Firmware build + binary byte-audit: app 6,892,032 B (17% free in the
-      8 MB app partition); init table byte-pattern-verified MADCTL 0x28 +
-      COLMOD 0x55 (old 0x48/0x66 absent); merged _full.bin packaged in
-      firmware/msp3520-video-firmware-v2/ and download/.
-- [ ] Owner hardware test: fps @40 MHz actual (expect ~14–16), color check
-      (RGB565/0x55; if red/blue swap: LCD_MADCTL 0x28→0x20), 80 MHz attempt.
-- [ ] Optional next iterations (see §6).
+## 6. Roadmap (revised after §2.5/§2.6 measurements)
 
-## 6. Future ideas (documented, not blocking)
-
-- Dirty-line skipping (send only changed line spans; huge win on static scenes).
-- 80 MHz unlock experiments: 5V VCC (module LDO then regulates properly — the
-  "3.3V + J1 open" configuration starves the rail, plausibly the 80 MHz
-  corruption cause), shorter/grounded jumper wires, IOMUX pins (already used).
-- LovyanGFX optional integration: clone into `components/`, project CMakeLists
-  `list(APPEND EXTRA_COMPONENT_DIRS ...)`, `REQUIRES LovyanGFX`; CI-tested on
-  IDF 6.1 (their `examples/Test/build_test`). Only for widget/sprite UIs —
-  NOT the video path (18bpp lock, §2.2).
-- ILI9488 GRAM emulator (command-stream → PNG) for full-stack pixel audit; QEMU
-  esp32s3 smoke run (GPSPI DMA fidelity unverified — time-boxed).
+1. **80 MHz experiment (critical path for ≥15 fps)**: the earlier corruption at
+   "65–80 MHz" (= real 80 MHz) may be supply-induced — the module run at 3.3 V
+   with J1 open starves the rail (~3.1 V). Try: 5 V on VCC (module's LDO then
+   regulates properly), SCK/MOSI jumpers as short as possible (<10 cm), ground
+   return alongside, then run the firmware's retest loop at 70/75/80.
+   Payoff: 20.7 fps ceiling (RGB666, fullscreen).
+2. If 80 MHz stays corrupt on this module: the practical ceiling on this
+   hardware is ~10 fps. Options then: accept it, or a parallel-interface
+   module (those accept RGB565 → 16.3 fps @40 MHz / 32.6 @80 MHz).
+3. 24 fps is **not achievable on ILI9488 over SPI** (needs 88.5 Mbps > 80 MHz
+   max bus). If 24 is a hard requirement, the panel must change (parallel RGB
+   panel, or a module with onboard SPI→parallel converter running RGB565, or
+   a different controller).
+4. Rejected on evidence: dirty-line skipping (5.7%), LovyanGFX (no gain,
+   forces same 18bpp), dual-core/PSRAM (bus-bound, not decode-bound).
 
 ## 7. Build & flash (ESP-IDF v6.1)
 
 ```
 cd firmware/msp3520-video-oc-test
 idf.py set-target esp32s3 && idf.py build
-idf.py -p COMx flash monitor      # or esptool write-flash 0x0 <merged>.bin
-# regenerating video.bin:
+idf.py -p COMx flash monitor
+# regenerating video.bin (RGB666 default):
 python3 tools/convert_video.py assets/Hill.mp4 firmware/msp3520-video-oc-test/main/video.bin
-python3 tools/host_test_video.py  # must print HOST VERIFY: PASS
+python3 tools/host_test_video.py   # must print HOST VERIFY: PASS
+# dirty-line savings measurement (why we rejected it):
+python3 tools/measure_dirty.py     # decodes the source video itself
 ```
+
+## 8. Incident log — v2 blank screen (2026-11-14)
+
+**Symptom**: v2 firmware (RGB565, COLMOD 0x55) — backlight on, panel completely
+blank, zero errors on the console; all SPI transactions completed. v1 (RGB666)
+on the same wiring showed perfect video.
+
+**Root cause**: the ILI9488 does **not** support 16-bit RGB565 on its native
+4-wire SPI (DBI Type-C) interface, despite §4.7.2 of the datasheet listing it
+in a bullet list. That same datasheet documents SPI data packing ONLY for
+3-bit and 18-bit (Fig 106/107) — there is no 16-bit SPI packing figure. Every
+major library independently forces 18-bit for ILI9488 SPI:
+
+- TFT_eSPI: `ILI9488_Init.h` writes 0x55 only for parallel; SPI gets 0x66.
+  Bodmer, TFT_eSPI issue #40 (2021): *"The screen can only be used in 18bit
+  colour mode with a SPI interface. In parallel mode it will work with 16 bit
+  colours."* — the same issue reports the blank screen with 0x55 on SPI.
+- LovyanGFX: `Panel_ILI948x.hpp` comment: "ILI9481/ILI9486 は SPIバス接続時は
+  16bppが使用できない" (cannot use 16bpp on SPI), citing ILI9486 spec p.125.
+- Arduino_GFX: plain `Arduino_ILI9488` (0x55) is the PARALLEL class; wiki:
+  *"This display SPI interface not support 16-bit SPI"*; issue #777 = our exact
+  symptom (ESP32-S3 + ILI9488 SPI, off-white blank with the 16-bit class).
+  Maintainer: *"According to ILI9488 data sheet, SPI not support 16-bit color
+  mode. That's why it dedicated a 18bit class."*
+- micropython-nano-gui DRIVERS.md §3.4.1: *"The chip only supports RGB565 color
+  when driven with a parallel interface. Native SPI supports only 18-bit
+  RGB666."* Modules that DO show RGB565-over-SPI carry an onboard
+  SPI→parallel converter (Waveshare approach). The MSP3520 is native SPI.
+- LCDWiki's own MSP3520 demo package: every Arduino sketch uses
+  `MODEL ILI9488_18` → init writes COLMOD **0x66**.
+
+**Fix (v3)**: revert the wire format to RGB666/0x66, but keep it runtime-
+selectable (`msp3520_set_wire_bpp`) with the blob header carrying bpp, so the
+converter can still emit 565 blobs for parallel-interface modules.
+
+**Lesson recorded**: a datasheet bullet list is not a guarantee; the absence of
+a documented data-packing figure plus every field library's contrary choice was
+the real signal. v2 shipped because that signal was under-weighted.
+
+## 9. Incident log — build-chain catches (2026-11-14, same day)
+
+1. **Converter crash (v3 edit gap)**: `build_rle_stream` still unpacked runs
+   as `hi, lo = line[s]` (565-only) after the bpp-generic refactor →
+   `ValueError: too many values to unpack` on a 666 stream, and the blob was
+   silently NOT regenerated. Fixed with bpp-generic emission
+   (`px = line[s].tobytes()`).
+2. **Stale-blob near-miss**: because of (1), the old 565 blob stayed in place;
+   the host test then failed with a size mismatch — exposing that
+   `test_video_host.c` dumped `VIDEO_LINE_BYTES` (1440) per line regardless
+   of blob bpp, which would have made a 565 blob "pass" the byte-compare.
+   Fixed: the harness now dumps `480 * h->bpp` per line, and the chain gained
+   an explicit blob-header gate (MIV2 + bpp=3) before the host test.
+   Also fixed: the chain's `echo rc=$?` masked the converter's exit code —
+   gates now run inside the `&&` chain.
+
+## 10. Sandbox/recycle notes (operational)
+
+The build sandbox recycles between sessions and has repeatedly restored STALE
+snapshots of the working tree (losing edits made late in a session; twice it
+reverted the MADCTL landscape fix, once the whole v2 tree, once the repo clone
+itself). Mitigation in force: push to this repo early and often; treat this
+GitHub repo, not the sandbox tree, as the source of truth; re-clone after any
+recycle and re-verify key bytes (MADCTL 0x28, COLMOD 0x66, MIV2 bpp=3) before
+building.
