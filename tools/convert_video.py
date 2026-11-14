@@ -5,10 +5,13 @@
 Pipeline (all steps verified by an in-script roundtrip):
   1. ffmpeg: crop letterbox bars (320x208), scale to 480x320, 15 fps, rgb24
   2. 3x3 median filter (kills h264 dither noise -> much better compression)
-  3. RGB888 -> RGB565 wire bytes (2 bytes/pixel, big-endian, ILI9488 COLMOD
-     0x55; datasheet sec. 4.7.2 lists 16bpp for the 4-wire SPI interface)
+  3. RGB888 -> wire bytes: RGB666 (3 bytes/pixel, COLMOD 0x66 — the only
+     pixel format the ILI9488 supports on its native 4-wire SPI interface;
+     verified against TFT_eSPI, LovyanGFX, Arduino_GFX and LCDWiki's own
+     MSP3520 demo) or RGB565 (2 bytes/pixel, 0x55 — parallel panels only;
+     on native SPI it produces a BLANK screen)
   4. interlace split: field 0 = even display lines, field 1 = odd lines, ...
-  5. per-line RLE: runs of [count-1][hi][lo], counts sum to 480 per line
+  5. per-line RLE: runs of [count-1] + bpp payload bytes, counts sum to 480
   6. LZSS: 64 KiB window, literal = 1 byte, match = 3 bytes (off 1..65535,
      len 4..259), 1 flag byte per 8 tokens
   7. blob = 24-byte header + LZSS stream
@@ -21,7 +24,7 @@ Blob header (little-endian):
   10 u16 flags            (bit0: 0 = even lines first)
   12 u32 rle_len          (decoded LZSS stream size in bytes)
   16 u32 fields           (frames * 2)
-  20 u32 bpp              (2 = RGB565 wire format)
+  20 u32 bpp              (3 = RGB666 default, 2 = RGB565)
 """
 
 import argparse
@@ -34,7 +37,7 @@ import numpy as np
 from PIL import Image, ImageFilter
 
 W, H = 480, 320
-BPP = 2                     # wire format: RGB565, 2 bytes/pixel
+BPP = 3                     # wire bytes/pixel: 3 = RGB666 (ILI9488 SPI)
 LZ_WIN = 65535
 LZ_MIN_MATCH = 5
 LZ_MAX_MATCH = 259
@@ -78,13 +81,27 @@ def to_rgb565(frames):
     return out
 
 
+def to_rgb666(frames):
+    """RGB888 -> the 3 bytes/pixel RGB666 wire format (top 6 bits each).
+    This is the ONLY pixel format the ILI9488 accepts on its native 4-wire
+    SPI interface (RGB565/0x55 is parallel-interface only and gives a
+    blank screen on native SPI)."""
+    n = frames.shape[0]
+    out = np.empty((n, H, W, 3), dtype=np.uint8)
+    out[:, :, :, 0] = (frames[:, :, :, 0] >> 3) << 3
+    out[:, :, :, 1] = (frames[:, :, :, 1] >> 2) << 2
+    out[:, :, :, 2] = (frames[:, :, :, 2] >> 3) << 3
+    print("step3: RGB666 conversion (3 bytes/pixel wire format)")
+    return out
+
+
 # ---------------------------------------------------------------- step 4-5
-def build_rle_stream(frames565):
+def build_rle_stream(frames_wire):
     """interlaced fields -> one long RLE byte stream"""
-    n = frames565.shape[0]
+    n = frames_wire.shape[0]
     stream = bytearray()
     for i in range(n):
-        f = frames565[i]
+        f = frames_wire[i]
         for field in (f[0::2], f[1::2]):          # 160 lines each
             for line in field:
                 same = np.all(line[1:] == line[:-1], axis=1)
@@ -235,8 +252,10 @@ def lzss_decode(src, total):
     return bytes(out)
 
 
-def rle_expand_stream(stream, n_fields, lines_per_field):
+def rle_expand_stream(stream, n_fields, lines_per_field, bpp=None):
     """expand the RLE stream back into display lines (verification)"""
+    if bpp is None:
+        bpp = BPP
     out = bytearray()
     sp = 0
     for f in range(n_fields):
@@ -245,8 +264,8 @@ def rle_expand_stream(stream, n_fields, lines_per_field):
             while px < W:
                 cnt = stream[sp] + 1
                 sp += 1
-                rgb = stream[sp:sp + BPP]
-                sp += BPP
+                rgb = stream[sp:sp + bpp]
+                sp += bpp
                 take = min(cnt, W - px)
                 out += bytes(rgb) * take
                 px += cnt
@@ -263,6 +282,10 @@ def main():
     ap.add_argument("--crop", default="320:208:0:16",
                     help="ffmpeg crop before scaling (iw:ih:0:0 = no crop)")
     ap.add_argument("--fps", type=int, default=15)
+    ap.add_argument("--bpp", type=int, choices=(2, 3), default=3,
+                    help="wire bytes/pixel: 3 = RGB666 (ILI9488 SPI, the "
+                         "default) or 2 = RGB565 (parallel-interface panels "
+                         "only — blank screen on native SPI)")
     ap.add_argument("--chain", type=int, default=24,
                     help="LZSS match chain length (deeper = smaller/slower)")
     ap.add_argument("--store", type=int, default=48,
@@ -270,12 +293,14 @@ def main():
     args = ap.parse_args()
 
     frames = decode_frames(args.input, args.crop, args.fps)
-    frames565 = to_rgb565(frames)
-    stream = build_rle_stream(frames565)
+    global BPP
+    BPP = args.bpp
+    frames_wire = to_rgb565(frames) if BPP == 2 else to_rgb666(frames)
+    stream = build_rle_stream(frames_wire)
     print("step6: LZSS encoding (this takes a minute) ...")
     sys.stdout.flush()
     lz = lzss_encode(stream, args.chain, args.store)
-    n_frames = frames565.shape[0]
+    n_frames = frames_wire.shape[0]
 
     hdr = struct.pack("<4sHHHHII I".replace(" ", ""),
                       b"MIV2", W, H, n_frames, 0,
@@ -290,7 +315,7 @@ def main():
     print(f"  blob total {len(blob)/1e6:.3f} MB "
           f"({len(blob)/n_frames/1024:.1f} KiB/frame)")
     raw = n_frames * W * H * BPP
-    print(f"  compression vs raw RGB565: {raw/len(blob):.1f}x")
+    print(f"  compression vs raw wire data: {raw/len(blob):.1f}x")
 
     # ---- full roundtrip verification
     print("\nverify: LZSS roundtrip ...", flush=True)
@@ -312,7 +337,7 @@ def main():
 
     f0 = interleave(lines[0:(H // 2) * W * BPP],
                     lines[(H // 2) * W * BPP:H * W * BPP])
-    assert f0.tobytes() == frames565[0].reshape(H, W * BPP).tobytes(), \
+    assert f0.tobytes() == frames_wire[0].reshape(H, W * BPP).tobytes(), \
         "RLE EXPANSION FAILED"
     print("  RLE + interlace reconstruction OK (frame 0 byte-identical)")
 
@@ -322,7 +347,7 @@ def main():
         base = fi * H * W3
         allexp[fi] = interleave(lines[base:base + (H // 2) * W3],
                                 lines[base + (H // 2) * W3:base + H * W3])
-    assert allexp.tobytes() == frames565.reshape(n_frames, H, W3).tobytes(), \
+    assert allexp.tobytes() == frames_wire.reshape(n_frames, H, W3).tobytes(), \
         "FULL EXPANSION FAILED"
     print(f"  all {n_frames} frames byte-identical — converter verified")
 

@@ -121,8 +121,8 @@ bool video_open(const uint8_t *blob, uint32_t blob_len)
     if (s.hdr.width != 480 || s.hdr.height != 320) {
         return false;                            /* built for this panel */
     }
-    if (s.hdr.bpp != 2) {
-        return false;                            /* RGB565 blobs only    */
+    if (s.hdr.bpp != 2 && s.hdr.bpp != 3) {
+        return false;                            /* 2 = RGB565, 3 = RGB666 */
     }
     s.src = blob + sizeof(video_hdr_t);
     s.src_len = blob_len - sizeof(video_hdr_t);
@@ -142,11 +142,17 @@ void video_rewind(void)
 
 bool video_read_line(uint8_t *dst)
 {
+    const int bpp = (s.hdr.bpp == 3) ? 3 : 2;
     int px = 0;
     while (px < 480) {
-        uint8_t cb, hi, lo;
-        if (!lz_byte(&cb) || !lz_byte(&hi) || !lz_byte(&lo)) {
+        uint8_t cb, pxb[3];
+        if (!lz_byte(&cb)) {
             return false;                        /* stream exhausted */
+        }
+        for (int k = 0; k < bpp; k++) {
+            if (!lz_byte(&pxb[k])) {
+                return false;                    /* stream exhausted */
+            }
         }
         int cnt = (int)cb + 1;                   /* stored as count-1: 1..256 */
         int take = cnt;
@@ -154,8 +160,9 @@ bool video_read_line(uint8_t *dst)
             take = 480 - px;
         }
         for (int i = 0; i < take; i++) {
-            *dst++ = hi;
-            *dst++ = lo;
+            for (int k = 0; k < bpp; k++) {
+                *dst++ = pxb[k];
+            }
         }
         px += take;
     }

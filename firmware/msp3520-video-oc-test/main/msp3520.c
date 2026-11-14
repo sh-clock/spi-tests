@@ -31,6 +31,7 @@
 
 static spi_device_handle_t s_spi;
 static uint32_t            s_clock_hz;
+static int                 s_wire_bpp = LCD_BPP;  /* 2 (565) or 3 (666)   */
 
 static spi_transaction_t s_tx[TX_RING_SLOTS];
 static int               s_tx_head;
@@ -224,7 +225,7 @@ esp_err_t msp3520_reinit_panel(void)
         { 0xC1, {0x41},       1, 0 },
         { 0xC5, {0x00,0x12,0x80}, 3, 0 },
         { 0x36, {LCD_MADCTL}, 1, 0 },                 /* MADCTL: landscape  */
-        { 0x3A, {0x55},       1, 0 },                 /* COLMOD: 16-bit RGB565 (datasheet §4.7.2) */
+        { 0x3A, {0x66},       1, 0 },                 /* COLMOD: 18-bit RGB666 (SPI-only mode) */
         { 0xB0, {0x00},       1, 0 },
         { 0xB1, {0xA0},       1, 0 },
         { 0xB4, {0x02},       1, 0 },
@@ -251,6 +252,16 @@ esp_err_t msp3520_reinit_panel(void)
         return err;
     }
 #endif
+
+    /* Re-assert the selected wire pixel format after the reset (the init
+     * table writes 0x66 — the only format for a native-SPI ILI9488). */
+    {
+        uint8_t colmod = (s_wire_bpp == 3) ? 0x66 : 0x55;
+        err = lcd_cmd(0x3A, &colmod, 1);
+        if (err != ESP_OK) {
+            return err;
+        }
+    }
 
     if (restore_hz != LCD_SAFE_CLOCK_HZ) {
         return msp3520_set_clock(restore_hz);
@@ -319,6 +330,27 @@ bool msp3520_read_id(uint8_t raw_d3[6], uint8_t raw_04[6])
     return ok;
 }
 
+/* ================= wire pixel format ================= */
+
+esp_err_t msp3520_set_wire_bpp(int bpp)
+{
+    uint8_t colmod;
+    if (bpp != 2 && bpp != 3) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    colmod = (bpp == 3) ? 0x66 : 0x55;
+    esp_err_t err = lcd_cmd(0x3A, &colmod, 1);
+    if (err == ESP_OK) {
+        s_wire_bpp = bpp;
+    }
+    return err;
+}
+
+int msp3520_get_wire_bpp(void)
+{
+    return s_wire_bpp;
+}
+
 /* ================= streaming + fill ================= */
 
 esp_err_t msp3520_prepare_stream(void)
@@ -347,7 +379,7 @@ esp_err_t msp3520_queue_line(uint16_t y, const uint8_t *line_bytes)
     if (err != ESP_OK) return err;
     err = lcd_queue(&ramwr, 1, false);
     if (err != ESP_OK) return err;
-    return lcd_queue(line_bytes, LCD_LINE_BYTES, true);
+    return lcd_queue(line_bytes, (size_t)LCD_H_RES * (size_t)s_wire_bpp, true);
 }
 
 esp_err_t msp3520_retire_line(void)
@@ -392,13 +424,23 @@ static esp_err_t push_lines(uint16_t y0, uint16_t lines, const uint8_t *line)
 
 esp_err_t msp3520_fill_screen(uint16_t color565)
 {
-    static uint8_t line[LCD_LINE_BYTES];
-    uint8_t px[2];
+    static uint8_t line[LCD_LINE_BYTES_MAX];
 
-    lcd_rgb565_to_be16(color565, px);
-    for (int x = 0; x < LCD_H_RES; x++) {
-        line[x * 2 + 0] = px[0];
-        line[x * 2 + 1] = px[1];
+    if (s_wire_bpp == 3) {
+        uint8_t rgb[3];
+        lcd_rgb565_to_666(color565, rgb);
+        for (int x = 0; x < LCD_H_RES; x++) {
+            line[x * 3 + 0] = rgb[0];
+            line[x * 3 + 1] = rgb[1];
+            line[x * 3 + 2] = rgb[2];
+        }
+    } else {
+        uint8_t px[2];
+        lcd_rgb565_to_be16(color565, px);
+        for (int x = 0; x < LCD_H_RES; x++) {
+            line[x * 2 + 0] = px[0];
+            line[x * 2 + 1] = px[1];
+        }
     }
 
     esp_err_t err = msp3520_prepare_stream();

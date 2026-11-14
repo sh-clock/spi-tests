@@ -40,7 +40,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-#define VIDEO_LINE_BYTES   (480 * 2)   /* one display line, RGB565 */
+#define VIDEO_LINE_BYTES   (480 * 3)   /* line buffer size: max over blob bpp */
 
 typedef struct __attribute__((packed)) {
     char     magic[4];      /* "MIV2"                                   */
@@ -50,7 +50,7 @@ typedef struct __attribute__((packed)) {
     uint16_t flags;         /* bit0: 0 = even lines in field 0          */
     uint32_t rle_len;       /* decoded RLE stream size in bytes         */
     uint32_t fields;        /* frames * 2                               */
-    uint32_t bpp;           /* bytes per pixel on the wire (2 = RGB565) */
+    uint32_t bpp;           /* wire bytes/px: 3 = RGB666 (SPI), 2 = RGB565  */
 } video_hdr_t;
 
 /* Parse the header and reset the decoder to field 0. */

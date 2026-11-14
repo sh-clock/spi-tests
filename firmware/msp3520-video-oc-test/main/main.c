@@ -4,7 +4,7 @@
  * Plays the converted video (embedded video.bin, 480x320, 15 fps source)
  * on the display using INTERLACING: each 15 fps frame is sent as two
  * fields — even display rows first, then odd rows. A field is 160 lines
- * (153,600 bytes) instead of a full frame's 320 lines, halving the bytes
+ * (230,400 bytes with RGB666) instead of a full frame's 320 lines, halving the bytes
  * per screen update; two consecutive fields make one complete picture.
  * Consequence worth knowing: on fast motion you may see a faint "combing"
  * on horizontal edges for one field time — that is inherent to interlacing
@@ -16,12 +16,12 @@
  *    y = clean   n = artifacts   r = restart this frequency   q = stop
  * After the time runs out you get the same question once more.
  *
- * Frame rates to expect: a field is 1,228,800 bits (RGB565), so the ideal
- * field time is bits/clock. 15 fps needs 30 fields/s = 33.3 ms/field,
- * reachable from ~37 MHz up. NOTE the ESP32-S3 cannot generate every
- * clock: requests of 35-60 MHz actually run at 40 MHz, 65-80 MHz at
- * 80 MHz. The console shows the measured fps at every frequency — a nice
- * second opinion on the bus limit in addition to the visual verdict.
+ * Frame rates to expect: with RGB666 a field is 1,843,200 bits, so the
+ * ideal field time is bits/clock. 15 fps needs 30 fields/s = 33.3 ms/field
+ * = ~62 MHz — the 40 MHz bus manages ~10 fps. NOTE the ESP32-S3 cannot
+ * generate every clock: requests of 35-60 MHz actually run at 40 MHz,
+ * 65-80 MHz at 80 MHz. The console shows the measured fps at every
+ * frequency — a nice second opinion on the bus limit.
  */
 #include <stdio.h>
 #include <string.h>
@@ -39,8 +39,8 @@
 extern const uint8_t video_start[] asm("_binary_video_bin_start");
 extern const uint8_t video_end[]   asm("_binary_video_bin_end");
 
-_Static_assert(VIDEO_LINE_BYTES == LCD_LINE_BYTES,
-               "video line size must match display line size");
+/* Line buffers are sized for the largest supported wire format; the bytes
+ * actually sent per line are 480 * video_hdr()->bpp (see msp3520_queue_line). */
 
 /* ================= configuration ================= */
 
@@ -443,7 +443,7 @@ static void retest_loop(void)
 static void print_banner(const video_hdr_t *hdr)
 {
     uint32_t blob_kb  = (uint32_t)(video_end - video_start) / 1024;
-    uint32_t raw_kb   = (uint32_t)hdr->frames * (480u * 320u * 2u) / 1024u;
+    uint32_t raw_kb   = (uint32_t)hdr->frames * (480u * 320u * hdr->bpp) / 1024u;
     uint32_t ratio10  = (raw_kb * 10 + blob_kb / 2) / blob_kb;   /* rounded */
 
     printf("\n");
@@ -460,9 +460,10 @@ static void print_banner(const video_hdr_t *hdr)
     print_x10(ratio10);
     printf("x smaller than the raw %u KiB of pixel data)\n", (unsigned)raw_kb);
     printf("\n");
-    printf("  RGB565 wire format: 2 bytes/pixel (COLMOD 0x55) - 33%% less\n");
-    printf("  data than RGB666. S3 clock reality: 35-60 MHz requests run\n");
-    printf("  at 40 MHz, 65-80 MHz at 80 MHz (no other steps exist).\n");
+    printf("  Wire format: %u bytes/pixel (COLMOD 0x%02X). S3 clock\n",
+           (unsigned)hdr->bpp, (unsigned)(hdr->bpp == 3 ? 0x66 : 0x55));
+    printf("  reality: 35-60 MHz requests run at 40 MHz, 65-80 MHz at\n");
+    printf("  80 MHz (no other steps exist).\n");
     printf("  INTERLACING: each frame goes out as 2 fields (even rows,\n");
     printf("  then odd rows) = half the bytes per screen update. Faint\n");
     printf("  combing on fast motion is NORMAL. Noise, torn stripes,\n");
@@ -506,6 +507,10 @@ void app_main(void)
             printf("Controller ID not found (MISO check only - carry on).\n");
         }
     }
+
+    /* the wire pixel format comes from the blob: RGB666 (bpp 3) is the
+     * only format the ILI9488 supports on its native SPI interface */
+    ESP_ERROR_CHECK(msp3520_set_wire_bpp(video_hdr()->bpp));
 
     /* a solid screen proves the whole push path before video starts */
     ESP_ERROR_CHECK(msp3520_fill_screen(0x001F));   /* dark blue */

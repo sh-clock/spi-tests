@@ -48,9 +48,10 @@
 /* --- Panel geometry ------------------------------------------------------ */
 #define LCD_H_RES     480
 #define LCD_V_RES     320
-#define LCD_BPP         2                          /* RGB565: 2 bytes/px  */
-#define LCD_LINE_BYTES  (LCD_H_RES * LCD_BPP)      /* 960                 */
-#define LCD_MAX_TRANSFER  (LCD_LINE_BYTES + 64)
+#define LCD_BPP         3                          /* default wire fmt (666) */
+#define LCD_LINE_BYTES  (LCD_H_RES * LCD_BPP)      /* 1440 (RGB666 line)     */
+#define LCD_LINE_BYTES_MAX (LCD_H_RES * 3)         /* 1440 (RGB666 line)     */
+#define LCD_MAX_TRANSFER  (LCD_LINE_BYTES_MAX + 64)
 
 /* Set to 1 if your panel shows inverted-looking colors (see README). */
 #define LCD_INVERT_COLORS 0
@@ -69,6 +70,16 @@ esp_err_t msp3520_init(void);
 /* Re-configure the SPI clock (device is removed and re-added on the bus). */
 esp_err_t msp3520_set_clock(uint32_t hz);
 uint32_t  msp3520_get_clock(void);
+
+/* Select the wire pixel format: 2 = RGB565 (COLMOD 0x55) or 3 = RGB666
+ * (COLMOD 0x66). IMPORTANT: the ILI9488 supports 18-bit (bpp 3) ONLY on
+ * its native 4-wire SPI interface — 16-bit RGB565 is for the parallel
+ * interface (verified: TFT_eSPI, LovyanGFX and Arduino_GFX all force
+ * 18-bit for ILI9488 SPI; LCDWiki's own MSP3520 demo uses 0x66; setting
+ * 0x55 on native SPI yields a blank screen). Line buffers passed to
+ * msp3520_queue_line() must hold 480*bpp bytes. */
+esp_err_t msp3520_set_wire_bpp(int bpp);
+int       msp3520_get_wire_bpp(void);
 
 /* Hardware-reset the panel and re-run the init sequence (at a safe 1 MHz).
  * Call before every test frequency so each one starts from a clean panel,
@@ -91,7 +102,7 @@ esp_err_t msp3520_prepare_stream(void);
 
 void msp3520_field_begin(void);
 
-/* Queue one display line (960 bytes, RGB565) at row `y`. Up to
+/* Queue one display line (480 * wire_bpp bytes) at row `y`. Up to
  * TX_LINES_IN_FLIGHT lines may be queued before a retire is needed. */
 esp_err_t msp3520_queue_line(uint16_t y, const uint8_t *line_bytes);
 
@@ -110,6 +121,15 @@ static inline void lcd_rgb565_to_be16(uint16_t c565, uint8_t out[2])
 {
     out[0] = (uint8_t)(c565 >> 8);
     out[1] = (uint8_t)(c565 & 0xFF);
+}
+
+/* Convert one RGB565 color to the 3-byte RGB666 wire format (the only
+ * format the ILI9488 accepts over its native 4-wire SPI interface). */
+static inline void lcd_rgb565_to_666(uint16_t c565, uint8_t out[3])
+{
+    out[0] = (c565 >> 8) & 0xF8;   /* red   */
+    out[1] = (c565 >> 3) & 0xFC;   /* green */
+    out[2] = (c565 << 3) & 0xF8;   /* blue  */
 }
 
 #ifdef __cplusplus
