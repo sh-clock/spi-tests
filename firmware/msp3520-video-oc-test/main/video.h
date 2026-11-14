@@ -3,19 +3,19 @@
  *
  * Blob layout (produced by tools/convert_video.py, all values little-endian):
  *
- *   offset 0   "MIV1" magic
+ *   offset 0   "MIV2" magic
  *   offset 4   u16 width            480
  *   offset 6   u16 height           320
  *   offset 8   u16 frames           e.g. 119
  *   offset 10  u16 flags            bit0: 0 = even display lines first
  *   offset 12  u32 rle_len          size of the decoded RLE stream (bytes)
  *   offset 16  u32 fields           frames * 2
- *   offset 20  u32 reserved
+ *   offset 20  u32 bpp              (2 = RGB565 wire format)
  *   offset 24  LZSS stream
  *
  * The LZSS stream decodes into an RLE byte stream. The RLE stream is a
  * sequence of LINE blocks: each line block is a series of runs
- *   [count-1][R][G][B]      (count = 1..256 pixels of one color)
+ *   [count-1][hi][lo]       (count = 1..256 pixels of one 16-bit color)
  * whose counts sum to exactly `width` pixels. A display FIELD (half a
  * frame in the interlaced sense) is `height/2` = 160 line blocks. Field 0
  * holds the EVEN display rows (0, 2, 4, ...), field 1 the ODD rows
@@ -40,17 +40,17 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-#define VIDEO_LINE_BYTES   (480 * 3)   /* one display line, RGB666 */
+#define VIDEO_LINE_BYTES   (480 * 2)   /* one display line, RGB565 */
 
 typedef struct __attribute__((packed)) {
-    char     magic[4];      /* "MIV1"                                   */
+    char     magic[4];      /* "MIV2"                                   */
     uint16_t width;         /* 480                                      */
     uint16_t height;        /* 320                                      */
     uint16_t frames;        /* number of source frames                  */
     uint16_t flags;         /* bit0: 0 = even lines in field 0          */
     uint32_t rle_len;       /* decoded RLE stream size in bytes         */
     uint32_t fields;        /* frames * 2                               */
-    uint32_t reserved;
+    uint32_t bpp;           /* bytes per pixel on the wire (2 = RGB565) */
 } video_hdr_t;
 
 /* Parse the header and reset the decoder to field 0. */

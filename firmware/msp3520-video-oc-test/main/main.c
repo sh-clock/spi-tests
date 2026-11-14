@@ -4,7 +4,7 @@
  * Plays the converted video (embedded video.bin, 480x320, 15 fps source)
  * on the display using INTERLACING: each 15 fps frame is sent as two
  * fields — even display rows first, then odd rows. A field is 160 lines
- * (230,400 bytes) instead of a full frame's 320 lines, halving the bytes
+ * (153,600 bytes) instead of a full frame's 320 lines, halving the bytes
  * per screen update; two consecutive fields make one complete picture.
  * Consequence worth knowing: on fast motion you may see a faint "combing"
  * on horizontal edges for one field time — that is inherent to interlacing
@@ -16,11 +16,12 @@
  *    y = clean   n = artifacts   r = restart this frequency   q = stop
  * After the time runs out you get the same question once more.
  *
- * Frame rates to expect: a field is 1,843,200 bits, so the ideal field time
- * is bits/clock. 15 fps needs 30 fields/s = 33.3 ms/field, which the bus
- * can only do from ~62 MHz up (with RGB666, 3 bytes/pixel). The console
- * shows the measured fps at every frequency — a nice second opinion on the
- * bus limit in addition to the visual verdict.
+ * Frame rates to expect: a field is 1,228,800 bits (RGB565), so the ideal
+ * field time is bits/clock. 15 fps needs 30 fields/s = 33.3 ms/field,
+ * reachable from ~37 MHz up. NOTE the ESP32-S3 cannot generate every
+ * clock: requests of 35-60 MHz actually run at 40 MHz, 65-80 MHz at
+ * 80 MHz. The console shows the measured fps at every frequency — a nice
+ * second opinion on the bus limit in addition to the visual verdict.
  */
 #include <stdio.h>
 #include <string.h>
@@ -442,7 +443,7 @@ static void retest_loop(void)
 static void print_banner(const video_hdr_t *hdr)
 {
     uint32_t blob_kb  = (uint32_t)(video_end - video_start) / 1024;
-    uint32_t raw_kb   = (uint32_t)hdr->frames * (480u * 320u * 3u) / 1024u;
+    uint32_t raw_kb   = (uint32_t)hdr->frames * (480u * 320u * 2u) / 1024u;
     uint32_t ratio10  = (raw_kb * 10 + blob_kb / 2) / blob_kb;   /* rounded */
 
     printf("\n");
@@ -459,6 +460,9 @@ static void print_banner(const video_hdr_t *hdr)
     print_x10(ratio10);
     printf("x smaller than the raw %u KiB of pixel data)\n", (unsigned)raw_kb);
     printf("\n");
+    printf("  RGB565 wire format: 2 bytes/pixel (COLMOD 0x55) - 33%% less\n");
+    printf("  data than RGB666. S3 clock reality: 35-60 MHz requests run\n");
+    printf("  at 40 MHz, 65-80 MHz at 80 MHz (no other steps exist).\n");
     printf("  INTERLACING: each frame goes out as 2 fields (even rows,\n");
     printf("  then odd rows) = half the bytes per screen update. Faint\n");
     printf("  combing on fast motion is NORMAL. Noise, torn stripes,\n");

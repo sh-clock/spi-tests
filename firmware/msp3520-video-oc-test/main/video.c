@@ -5,10 +5,10 @@
  * line of this file):
  *
  *   LZSS  — general "replace repeated byte sequences with back-references"
- *           decompression, 64 KiB history ring. The flash image is ~5.5 MB
- *           and expands to ~13.7 MB of RLE data.
- *   RLE   — per display line, runs of [count-1][R][G][B] expand into the
- *           1440-byte RGB666 line that goes on the wire.
+ *           decompression, 64 KiB history ring. The flash image is ~6.7 MB
+ *           and expands to ~13.3 MB of RLE data.
+ *   RLE   — per display line, runs of [count-1][hi][lo] expand into the
+ *           960-byte RGB565 line that goes on the wire.
  *
  * Both layers are streamed: at no point does a whole frame exist in RAM.
  * Peak RAM use = 64 KiB ring + 259 B pending + the caller's line buffers.
@@ -115,11 +115,14 @@ bool video_open(const uint8_t *blob, uint32_t blob_len)
     /* memcpy: the packed struct may be unaligned-safe, but this way it is
      * guaranteed on every core (the blob lives in flash, mapped read-only) */
     memcpy(&s.hdr, blob, sizeof(video_hdr_t));
-    if (memcmp(s.hdr.magic, "MIV1", 4) != 0) {
+    if (memcmp(s.hdr.magic, "MIV2", 4) != 0) {
         return false;
     }
     if (s.hdr.width != 480 || s.hdr.height != 320) {
         return false;                            /* built for this panel */
+    }
+    if (s.hdr.bpp != 2) {
+        return false;                            /* RGB565 blobs only    */
     }
     s.src = blob + sizeof(video_hdr_t);
     s.src_len = blob_len - sizeof(video_hdr_t);
@@ -141,8 +144,8 @@ bool video_read_line(uint8_t *dst)
 {
     int px = 0;
     while (px < 480) {
-        uint8_t cb, r, g, b;
-        if (!lz_byte(&cb) || !lz_byte(&r) || !lz_byte(&g) || !lz_byte(&b)) {
+        uint8_t cb, hi, lo;
+        if (!lz_byte(&cb) || !lz_byte(&hi) || !lz_byte(&lo)) {
             return false;                        /* stream exhausted */
         }
         int cnt = (int)cb + 1;                   /* stored as count-1: 1..256 */
@@ -151,9 +154,8 @@ bool video_read_line(uint8_t *dst)
             take = 480 - px;
         }
         for (int i = 0; i < take; i++) {
-            *dst++ = r;
-            *dst++ = g;
-            *dst++ = b;
+            *dst++ = hi;
+            *dst++ = lo;
         }
         px += take;
     }

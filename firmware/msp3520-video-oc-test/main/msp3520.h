@@ -23,7 +23,7 @@
  *  - new streaming API for interlaced fields:
  *      msp3520_prepare_stream()   once per panel init (sets column window)
  *      msp3520_field_begin()      CS low
- *      msp3520_queue_line(y, px)  queue PASET+RAMWR+1440 B for one line
+ *      msp3520_queue_line(y, px)  queue PASET+RAMWR+960 B for one line
  *      msp3520_retire_line()      wait until the oldest queued line is done
  *      msp3520_field_end()        CS high
  *    Keeping two lines "in flight" lets the CPU decode the next line while
@@ -48,12 +48,17 @@
 /* --- Panel geometry ------------------------------------------------------ */
 #define LCD_H_RES     480
 #define LCD_V_RES     320
-#define LCD_BPP         3                          /* RGB666: 3 bytes/px  */
-#define LCD_LINE_BYTES  (LCD_H_RES * LCD_BPP)      /* 1440                */
+#define LCD_BPP         2                          /* RGB565: 2 bytes/px  */
+#define LCD_LINE_BYTES  (LCD_H_RES * LCD_BPP)      /* 960                 */
 #define LCD_MAX_TRANSFER  (LCD_LINE_BYTES + 64)
 
 /* Set to 1 if your panel shows inverted-looking colors (see README). */
 #define LCD_INVERT_COLORS 0
+
+/* MADCTL (memory access control). 0x28 = landscape 480x320, origin top-left
+ * (MV row/column exchange + BGR). If the picture comes out upside-down on
+ * your mounting, use 0xE8 (adds MY|MX = 180-degree rotation). */
+#define LCD_MADCTL 0x28
 
 #ifdef __cplusplus
 extern "C" {
@@ -86,7 +91,7 @@ esp_err_t msp3520_prepare_stream(void);
 
 void msp3520_field_begin(void);
 
-/* Queue one display line (1440 bytes, RGB666) at row `y`. Up to
+/* Queue one display line (960 bytes, RGB565) at row `y`. Up to
  * TX_LINES_IN_FLIGHT lines may be queued before a retire is needed. */
 esp_err_t msp3520_queue_line(uint16_t y, const uint8_t *line_bytes);
 
@@ -99,12 +104,12 @@ void msp3520_field_end(void);
 /* How many lines the player may queue before retiring (double buffering). */
 #define TX_LINES_IN_FLIGHT 2
 
-/* Convert one RGB565 color to the 3-byte RGB666 triplet used on the wire. */
-static inline void lcd_rgb565_to_666(uint16_t c565, uint8_t out[3])
+/* Convert one RGB565 color to the 2-byte big-endian wire format
+ * (hi = R4..R0 G5..G3, lo = G2..G0 B4..B0 — ILI9488 16bpp, MSB first). */
+static inline void lcd_rgb565_to_be16(uint16_t c565, uint8_t out[2])
 {
-    out[0] = (c565 >> 8) & 0xF8;   /* red   */
-    out[1] = (c565 >> 3) & 0xFC;   /* green */
-    out[2] = (c565 << 3) & 0xF8;   /* blue  */
+    out[0] = (uint8_t)(c565 >> 8);
+    out[1] = (uint8_t)(c565 & 0xFF);
 }
 
 #ifdef __cplusplus

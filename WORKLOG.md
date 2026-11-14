@@ -73,8 +73,11 @@ Safe SPI limit per owner's sweep: "60 MHz" (see §2 — this is actually 40 MHz)
   geometry/color-order behavior; BGR bit semantics identical to verified v1).
 - Blob "MIV2": same LZSS(64K win)+per-line-RLE layers; RLE run = `[count-1][hi][lo]`;
   header field `reserved` → `bpp` (=2). Decoder change is 6 lines; LZSS untouched.
-- `TX_LINES_IN_FLIGHT` 2 → 4 (overlap decode/DMA; SPI queue sized accordingly).
-- Console prints the ACTUAL SPI clock next to the requested one.
+- `TX_LINES_IN_FLIGHT` stays 2: at 40 MHz the wire (192 µs/line) is the
+  bottleneck and the decoder outpaces it; 2 lines fully overlap decode/DMA
+  (16-slot ring, 8 used — audit-verified retire pattern).
+- The banner prints the S3 clock-mapping reality (35–60→40, 65–80→80 MHz);
+  full mapping documented in §2.1.
 - Fallback documented: if a panel rejects 0x55 (unlikely per §2.3), revert to v1
   commit (this repo) or set COLMOD 0x66 + rebuild blob with `--bpp 3`.
 
@@ -88,14 +91,30 @@ Safe SPI limit per owner's sweep: "60 MHz" (see §2 — this is actually 40 MHz)
 - Hardware (owner): flash, confirm colors/orientation, read measured fps at
   40 MHz (expect ~14–16) and optionally 80 MHz after the 5V/short-wire test.
 
+RESULTS SO FAR (v2):
+- Converter roundtrip: all 119 frames byte-identical (in-script asserts, PASS).
+- Host verify of the DEVICE decoder: gcc-compiled main/video.c decoded all
+  38,080 lines = 36,556,800 bytes, sha256 43709f57a49cc8dc, byte-identical
+  to the Python reference expansion. PASS.
+- Audit agent (harsh, no-assumptions) found + we fixed: MADCTL 0x48
+  regression (a sandbox recycle had restored the pre-landscape-fix source),
+  a stale MIV1 blob in the repo tree, stale CMakeLists (`REQUIRES driver`),
+  and 5 comment/doc errors (field bits 1,228,800 & ~37 MHz, blob sizes,
+  MIV2 labels, "33% less"). Everything functional was verified clean.
+
 ## 5. Status / next steps
 
 - [x] Research (§2) — three parallel agents, sources cited above.
 - [x] Baseline v1 imported + this worklog.
-- [ ] v2 implementation (§3) — IN PROGRESS at time of this commit.
-- [ ] Host verification (§4) + firmware build + binary audit.
-- [ ] Parallel audit agents on the v2 diff (coordinate via this file).
-- [ ] Owner hardware test: fps @40 MHz actual, color check, 80 MHz attempt.
+- [x] v2 implementation (§3) — RGB565/MIV2, all edits applied.
+- [x] Host verification (§4): converter roundtrip PASS + device-decoder
+      byte-identity PASS (sha256 43709f57a49cc8dc).
+- [x] Parallel audit agent on the v2 diff — 2 blockers + 5 minors found,
+      ALL fixed (see §4 results). Sandbox recycle had restored pre-fix
+      sources; re-applied MADCTL 0x28 + CMakeLists component split.
+- [ ] Firmware build + binary byte-audit (in progress — see next commit).
+- [ ] Owner hardware test: fps @40 MHz actual (expect ~14–16), color check
+      (RGB565/0x55; if red/blue swap: LCD_MADCTL 0x28→0x20), 80 MHz attempt.
 - [ ] Optional next iterations (see §6).
 
 ## 6. Future ideas (documented, not blocking)

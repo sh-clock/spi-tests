@@ -7,7 +7,7 @@
  *    transaction, polled or queued). t->user == 1 means "data phase" (D/C
  *    high), NULL means "command byte" (D/C low).
  *  - msp3520_queue_line() queues FOUR transactions per display line
- *    (PASET cmd, PASET params, RAMWR cmd, 1440 B pixels) and returns
+ *    (PASET cmd, PASET params, RAMWR cmd, 960 B pixels) and returns
  *    immediately; DMA pushes them while the CPU decodes the next line.
  *
  * A field (one interlaced half-frame = 160 display lines of one parity) is
@@ -223,8 +223,8 @@ esp_err_t msp3520_reinit_panel(void)
         { 0xC0, {0x17,0x15}, 2, 0 },
         { 0xC1, {0x41},       1, 0 },
         { 0xC5, {0x00,0x12,0x80}, 3, 0 },
-        { 0x36, {0x48},       1, 0 },                 /* MADCTL             */
-        { 0x3A, {0x66},       1, 0 },                 /* COLMOD: 18-bit     */
+        { 0x36, {LCD_MADCTL}, 1, 0 },                 /* MADCTL: landscape  */
+        { 0x3A, {0x55},       1, 0 },                 /* COLMOD: 16-bit RGB565 (datasheet §4.7.2) */
         { 0xB0, {0x00},       1, 0 },
         { 0xB1, {0xA0},       1, 0 },
         { 0xB4, {0x02},       1, 0 },
@@ -393,13 +393,12 @@ static esp_err_t push_lines(uint16_t y0, uint16_t lines, const uint8_t *line)
 esp_err_t msp3520_fill_screen(uint16_t color565)
 {
     static uint8_t line[LCD_LINE_BYTES];
-    uint8_t rgb[3];
+    uint8_t px[2];
 
-    lcd_rgb565_to_666(color565, rgb);
+    lcd_rgb565_to_be16(color565, px);
     for (int x = 0; x < LCD_H_RES; x++) {
-        line[x * 3 + 0] = rgb[0];
-        line[x * 3 + 1] = rgb[1];
-        line[x * 3 + 2] = rgb[2];
+        line[x * 2 + 0] = px[0];
+        line[x * 2 + 1] = px[1];
     }
 
     esp_err_t err = msp3520_prepare_stream();

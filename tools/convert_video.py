@@ -5,22 +5,23 @@
 Pipeline (all steps verified by an in-script roundtrip):
   1. ffmpeg: crop letterbox bars (320x208), scale to 480x320, 15 fps, rgb24
   2. 3x3 median filter (kills h264 dither noise -> much better compression)
-  3. RGB888 -> RGB666 wire bytes (3 bytes/pixel, what the ILI9488 takes)
+  3. RGB888 -> RGB565 wire bytes (2 bytes/pixel, big-endian, ILI9488 COLMOD
+     0x55; datasheet sec. 4.7.2 lists 16bpp for the 4-wire SPI interface)
   4. interlace split: field 0 = even display lines, field 1 = odd lines, ...
-  5. per-line RLE: runs of [count-1][R][G][B], counts sum to 480 per line
+  5. per-line RLE: runs of [count-1][hi][lo], counts sum to 480 per line
   6. LZSS: 64 KiB window, literal = 1 byte, match = 3 bytes (off 1..65535,
      len 4..259), 1 flag byte per 8 tokens
   7. blob = 24-byte header + LZSS stream
 
 Blob header (little-endian):
-  0  "MIV1"
+  0  "MIV2"
   4  u16 width            (480)
   6  u16 height           (320)
   8  u16 frames           (119)
   10 u16 flags            (bit0: 0 = even lines first)
   12 u32 rle_len          (decoded LZSS stream size in bytes)
   16 u32 fields           (frames * 2)
-  20 u32 reserved         (0)
+  20 u32 bpp              (2 = RGB565 wire format)
 """
 
 import argparse
@@ -33,6 +34,7 @@ import numpy as np
 from PIL import Image, ImageFilter
 
 W, H = 480, 320
+BPP = 2                     # wire format: RGB565, 2 bytes/pixel
 LZ_WIN = 65535
 LZ_MIN_MATCH = 5
 LZ_MAX_MATCH = 259
@@ -61,30 +63,28 @@ def decode_frames(src, crop, fps):
     return out
 
 
-def to_rgb666(frames, drop_green_lsb=False):
-    """RGB888 -> the 3 bytes/pixel RGB666 wire format (top bits only).
-    drop_green_lsb: quantize green to 5 bits too (RGB555 effective) —
-    merges neighbouring colors into longer runs, invisible on this panel."""
+def to_rgb565(frames):
+    """RGB888 -> the 2 bytes/pixel RGB565 wire format, big-endian
+    (hi = R4..R0 G5..G3, lo = G2..G0 B4..B0 — ILI9488 16bpp, MSB first)."""
     n = frames.shape[0]
-    out = np.empty((n, H, W, 3), dtype=np.uint8)
-    out[:, :, :, 0] = (frames[:, :, :, 0] >> 3) << 3
-    if drop_green_lsb:
-        out[:, :, :, 1] = (frames[:, :, :, 1] >> 3) << 3
-    else:
-        out[:, :, :, 1] = (frames[:, :, :, 1] >> 2) << 2
-    out[:, :, :, 2] = (frames[:, :, :, 2] >> 3) << 3
-    print("step3: RGB666 conversion"
-          + (" (green LSB dropped)" if drop_green_lsb else ""))
+    r = (frames[:, :, :, 0].astype(np.uint16) >> 3) & 0x1F   # 5 bits
+    g = (frames[:, :, :, 1].astype(np.uint16) >> 2) & 0x3F   # 6 bits
+    b = (frames[:, :, :, 2].astype(np.uint16) >> 3) & 0x1F   # 5 bits
+    c565 = (r << 11) | (g << 5) | b
+    out = np.empty((n, H, W, 2), dtype=np.uint8)
+    out[:, :, :, 0] = (c565 >> 8) & 0xFF    # hi byte goes on the wire first
+    out[:, :, :, 1] = c565 & 0xFF
+    print("step3: RGB565 conversion (2 bytes/pixel wire format)")
     return out
 
 
 # ---------------------------------------------------------------- step 4-5
-def build_rle_stream(frames666):
+def build_rle_stream(frames565):
     """interlaced fields -> one long RLE byte stream"""
-    n = frames666.shape[0]
+    n = frames565.shape[0]
     stream = bytearray()
     for i in range(n):
-        f = frames666[i]
+        f = frames565[i]
         for field in (f[0::2], f[1::2]):          # 160 lines each
             for line in field:
                 same = np.all(line[1:] == line[:-1], axis=1)
@@ -92,11 +92,11 @@ def build_rle_stream(frames666):
                 starts = np.concatenate(([0], breaks))
                 ends = np.concatenate((breaks, [len(line)]))
                 for s, e in zip(starts, ends):
-                    r, g, b = line[s]
+                    hi, lo = line[s]
                     L = e - s
                     while L > 0:
                         c = min(L, 256)
-                        stream += bytes((c - 1, r, g, b))
+                        stream += bytes((c - 1, hi, lo))
                         L -= c
     print(f"step4+5: {n} frames = {n*2} fields, RLE stream "
           f"{len(stream)/1e6:.2f} MB")
@@ -245,8 +245,8 @@ def rle_expand_stream(stream, n_fields, lines_per_field):
             while px < W:
                 cnt = stream[sp] + 1
                 sp += 1
-                rgb = stream[sp:sp + 3]
-                sp += 3
+                rgb = stream[sp:sp + BPP]
+                sp += BPP
                 take = min(cnt, W - px)
                 out += bytes(rgb) * take
                 px += cnt
@@ -263,8 +263,6 @@ def main():
     ap.add_argument("--crop", default="320:208:0:16",
                     help="ffmpeg crop before scaling (iw:ih:0:0 = no crop)")
     ap.add_argument("--fps", type=int, default=15)
-    ap.add_argument("--drop-green-lsb", action="store_true",
-                    help="quantize green to 5 bits (better compression)")
     ap.add_argument("--chain", type=int, default=24,
                     help="LZSS match chain length (deeper = smaller/slower)")
     ap.add_argument("--store", type=int, default=48,
@@ -272,16 +270,16 @@ def main():
     args = ap.parse_args()
 
     frames = decode_frames(args.input, args.crop, args.fps)
-    frames666 = to_rgb666(frames, args.drop_green_lsb)
-    stream = build_rle_stream(frames666)
+    frames565 = to_rgb565(frames)
+    stream = build_rle_stream(frames565)
     print("step6: LZSS encoding (this takes a minute) ...")
     sys.stdout.flush()
     lz = lzss_encode(stream, args.chain, args.store)
-    n_frames = frames666.shape[0]
+    n_frames = frames565.shape[0]
 
     hdr = struct.pack("<4sHHHHII I".replace(" ", ""),
-                      b"MIV1", W, H, n_frames, 0,
-                      len(stream), n_frames * 2, 0)
+                      b"MIV2", W, H, n_frames, 0,
+                      len(stream), n_frames * 2, BPP)
     blob = hdr + lz
     with open(args.output, "wb") as f:
         f.write(blob)
@@ -291,8 +289,8 @@ def main():
           f"RLE {len(stream)/1e6:.2f} MB, LZ {len(lz)/1e6:.2f} MB")
     print(f"  blob total {len(blob)/1e6:.3f} MB "
           f"({len(blob)/n_frames/1024:.1f} KiB/frame)")
-    raw = n_frames * W * H * 3
-    print(f"  compression vs raw RGB666: {raw/len(blob):.1f}x")
+    raw = n_frames * W * H * BPP
+    print(f"  compression vs raw RGB565: {raw/len(blob):.1f}x")
 
     # ---- full roundtrip verification
     print("\nverify: LZSS roundtrip ...", flush=True)
@@ -304,7 +302,7 @@ def main():
 
     def interleave(field_even, field_odd):
         """two 160-line fields -> one 320-line frame (bytes)"""
-        W3 = W * 3
+        W3 = W * BPP
         ev = np.frombuffer(field_even, dtype=np.uint8).reshape(H // 2, W3)
         od = np.frombuffer(field_odd, dtype=np.uint8).reshape(H // 2, W3)
         fr = np.empty((H, W3), dtype=np.uint8)
@@ -312,19 +310,19 @@ def main():
         fr[1::2] = od
         return fr
 
-    f0 = interleave(lines[0:(H // 2) * W * 3],
-                    lines[(H // 2) * W * 3:H * W * 3])
-    assert f0.tobytes() == frames666[0].reshape(H, W * 3).tobytes(), \
+    f0 = interleave(lines[0:(H // 2) * W * BPP],
+                    lines[(H // 2) * W * BPP:H * W * BPP])
+    assert f0.tobytes() == frames565[0].reshape(H, W * BPP).tobytes(), \
         "RLE EXPANSION FAILED"
     print("  RLE + interlace reconstruction OK (frame 0 byte-identical)")
 
-    W3 = W * 3
+    W3 = W * BPP
     allexp = np.empty((n_frames, H, W3), dtype=np.uint8)
     for fi in range(n_frames):
         base = fi * H * W3
         allexp[fi] = interleave(lines[base:base + (H // 2) * W3],
                                 lines[base + (H // 2) * W3:base + H * W3])
-    assert allexp.tobytes() == frames666.reshape(n_frames, H, W3).tobytes(), \
+    assert allexp.tobytes() == frames565.reshape(n_frames, H, W3).tobytes(), \
         "FULL EXPANSION FAILED"
     print(f"  all {n_frames} frames byte-identical — converter verified")
 
