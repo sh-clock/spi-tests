@@ -1,0 +1,31 @@
+MSP3520 video player v2 (RGB565) - flashable firmware
+ESP32-S3 (esp32s3) - ESP-IDF v6.1 - built 2026-11-14
+480x320 fullscreen interlaced video, RGB565 (COLMOD 0x55). Fps ceiling at
+the real 40 MHz bus clock: 16.3 (RGB666 v1 managed 10.8 max).
+
+FILES
+  bootloader.bin                 flash at 0x0
+  partition-table.bin            flash at 0x8000
+  msp3520_video_oc_test.bin      flash at 0x10000  (6.9 MB - video inside)
+  msp3520_video_oc_test_full.bin all three merged - flash at 0x0 (easiest)
+
+FLASH (adjust COM port; no extra esptool flags needed):
+  C:\Espressif\tools\python\v6.1\venv\Scripts\python.exe -m esptool --chip esp32s3 -p COM10 -b 460800 --before default-reset --after hard-reset write-flash 0x0 msp3520_video_oc_test_full.bin
+
+CLOCK REALITY (also printed on the console banner):
+  The ESP32-S3 cannot generate 60 MHz: requests of 35-60 MHz actually run
+  at 40 MHz, 65-80 MHz at 80 MHz. Your earlier sweep result "clean to 60,
+  corrupt above" therefore means 40 MHz clean / 80 MHz corrupt.
+  Expected measured fps: ~14-16 at 40 MHz. The 80 MHz steps are worth one
+  more try with 5V supply + short wires (see WORKLOG 2.1/6): ceiling 32.6.
+
+CHECK AFTER FLASHING
+  Colors: RGB565 is new for this panel (datasheet-listed; Arduino_GFX ships
+  it). If red/blue look swapped -> LCD_MADCTL 0x28 -> 0x20 in
+  main/msp3520.h, rebuild. If the panel rejects 16bpp entirely (garbage),
+  fall back to the v1 RGB666 build (repo commit 0a5b4ba).
+  Orientation: landscape, origin top-left. Upside-down -> LCD_MADCTL 0xE8.
+  Console: banner, then per-step measured fps; keys y/n/r/q as before.
+
+WIRING (unchanged): CS GPIO10, DC GPIO9, RESET GPIO14, MOSI GPIO11,
+SCK GPIO12, backlight GPIO47, VCC 3.3V (or 5V), GND.

@@ -112,7 +112,10 @@ RESULTS SO FAR (v2):
 - [x] Parallel audit agent on the v2 diff — 2 blockers + 5 minors found,
       ALL fixed (see §4 results). Sandbox recycle had restored pre-fix
       sources; re-applied MADCTL 0x28 + CMakeLists component split.
-- [ ] Firmware build + binary byte-audit (in progress — see next commit).
+- [x] Firmware build + binary byte-audit: app 6,892,032 B (17% free in the
+      8 MB app partition); init table byte-pattern-verified MADCTL 0x28 +
+      COLMOD 0x55 (old 0x48/0x66 absent); merged _full.bin packaged in
+      firmware/msp3520-video-firmware-v2/ and download/.
 - [ ] Owner hardware test: fps @40 MHz actual (expect ~14–16), color check
       (RGB565/0x55; if red/blue swap: LCD_MADCTL 0x28→0x20), 80 MHz attempt.
 - [ ] Optional next iterations (see §6).
