@@ -1,0 +1,7 @@
+# ESP-IDF build output
+build/
+# generated on first build from sdkconfig.defaults
+sdkconfig
+# editor / OS noise
+.vscode/
+.DS_Store

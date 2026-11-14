@@ -1,0 +1,21 @@
+# Project defaults for `idf.py set-target esp32s3` (applied on first build).
+
+CONFIG_IDF_TARGET="esp32s3"
+
+# IMPORTANT for this project: the video lives inside the app image, so we
+# need the whole 8 MB flash of the ESP32-S3-DevKitC-1.
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+
+# Use the custom partition table in partitions.csv (single big factory app,
+# no OTA slots).
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# Console output on the USB-to-UART port (115200 baud)...
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+# ...and also mirrored on the native USB port.
+CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG=y
+
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
