@@ -140,12 +140,6 @@ esp_err_t msp3520_init(void)
         return err;
     }
 
-#if LCD_EDGE_DRIVE_CAP >= 0
-    /* optional edge-rate experiment (see msp3520.h) */
-    gpio_set_drive_capability(LCD_PIN_SCLK, (gpio_drive_cap_t)LCD_EDGE_DRIVE_CAP);
-    gpio_set_drive_capability(LCD_PIN_MOSI, (gpio_drive_cap_t)LCD_EDGE_DRIVE_CAP);
-#endif
-
     const spi_bus_config_t buscfg = {
         .sclk_io_num     = LCD_PIN_SCLK,
         .mosi_io_num     = LCD_PIN_MOSI,
@@ -202,6 +196,22 @@ uint32_t msp3520_get_clock(void)
 void msp3520_backlight(bool on)
 {
     gpio_set_level(LCD_PIN_BL, on ? 1 : 0);
+}
+
+void msp3520_set_edge_drive(int cap)
+{
+    /* Live experiment knob for the 80 MHz stability question: set the GPIO
+     * drive capability of SCK/MOSI. 0..3 = weakest..strongest edges
+     * (gpio_drive_cap_t). The SPI peripheral keeps running; only the pad
+     * drive strength changes, so it can be flipped mid-playback with the
+     * 'd' key. Weaker settings (0/1) slow the edges and can reduce
+     * ringing/reflections on jumper wires — try each while watching for
+     * snow at the 65-80 MHz steps. */
+    if (cap < 0 || cap > 3) {
+        return;
+    }
+    gpio_set_drive_capability(LCD_PIN_SCLK, (gpio_drive_cap_t)cap);
+    gpio_set_drive_capability(LCD_PIN_MOSI, (gpio_drive_cap_t)cap);
 }
 
 esp_err_t msp3520_reinit_panel(void)

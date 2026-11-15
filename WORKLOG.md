@@ -204,3 +204,61 @@ tree, once the repo clone + ESP-IDF + setup scripts). Mitigation in force:
 push early and often; this GitHub repo is the source of truth; re-clone
 after any recycle and re-verify key bytes (MADCTL 0x28, COLMOD 0x66, MIV2
 bpp=3 + flags bit1) before building.
+
+## 12. Research verdicts — the 15 fps trawl (2026-11-15, 4 parallel agents)
+
+All claims below carry source URLs in the session record; headline verdicts:
+
+1. **Parallel/8080/DPI on the MSP3520: physically impossible.** Vendor
+   schematic: DB0–DB17 (FPC pins 15–32), DEN/PCLK/HSYNC/VSYNC (34–37) and
+   TE (pin 7) are UNROUTED on the module PCB; IM2 strapped to 3V3 (=111,
+   4-wire SPI); RD tied high; the header is 14 pins (the "18" = 14 + the
+   unpopulated SD-card header J4). Only FPC micro-surgery (0.5 mm pitch)
+   would reach the parallel bus. Sources: LCDWiki schematic
+   (3.5寸SPI模块原理图.pdf), QD3503 panel spec, MSP3520 user manual.
+2. **80 MHz SPI on ILI9488: die-limited verdict reinforced, but not
+   absolutely closed.** Convergent ceiling evidence: ESPHome default 40,
+   LovyanGFX maintainer "usually safe 40", LVGL forum 80 MHz = black
+   screen, RPi fbcp ~50 MHz borderline-with-corruption. Verified counter-
+   examples on other hosts/boards: 65 MHz (ESP32 CYD, PROF0UND issue #1),
+   60 MHz (Teensy 4.1, vindar/ILI9341_T4 #5, ~16 fps ILI9488), 80–93.75
+   MHz no-glitch (PicoCalc ILI9488, Rockchip host, PCB-short traces,
+   picocalc-drivers PR #32), TFT_eSPI ships a commented 80 MHz option.
+   ESP32-S3-specific factor (IDF docs): GPIO-matrix routing == IOMUX only
+   ≤40 MHz; above that, IOMUX pins + shortest wires matter — our SCK=12/
+   MOSI=11 ARE the FSPI IOMUX pins already. Remaining $0 levers: series-R
+   (22–100 Ω on SCK at the ESP32 end), GND wire alongside SCK, <100 mm
+   wires, and GPIO drive-capacity tuning (now a live hotkey, §13).
+   Expectation: LOW–MEDIUM. 55–65 MHz is the well-evidenced gray zone —
+   but the S3 GPSPI cannot generate it (40 or 80 only), so it is
+   80-or-nothing on this module.
+3. **15 fps arithmetic on this module over SPI: only an 80 MHz rescue can
+   do it.** Every other lever is verified insufficient for this content:
+   dirty-rect ≈ 0 gain on full-screen pan (rjonkman: 60 fps sparse vs
+   20 fps heavy animation); interlacing has no precedent + combs; TE pin
+   unrouted; DMA-gap tweaks ≤ 0.5%; 3-bit mode rejected by owner; 16-bit
+   impossible (5th independent confirmation — vindar maintainer quote).
+4. **If 80 MHz fails: hardware swap is the only path.** Same panel
+   parallel = MakerFabs ESP32-S3 Parallel 3.5" ILI9488 (16-bit 8080 via
+   esp_lcd i80; verified 37→58 fps LVGL vs SPI; ~86 fps ceiling at
+   20 MHz PCLK). Or ST7796 SPI module (RGB565 native, 80 MHz-class →
+   ~32 fps). NOT pursued — owner does not want a new screen.
+5. **esp_lcd I80 implementation fact sheet captured** (for a future swap):
+   PCLK = 80/n from PLL160M (n=1..64) or 120/n from PLL240M (30/24 MHz
+   reachable), ILI9488 8080 twc = 40 ns (25 MHz max), IM straps 011 =
+   8-bit / 010 = 16-bit, official i80_controller example is CC0-1.0,
+   atanisoft/esp_lcd_ili9488 (MIT) has the full init table + draw_bitmap
+   pattern; DC/CS driven by hardware per phase; GPIO-matrix = any pins.
+
+## 13. v4.1 (2026-11-15) — the 80 MHz experiment build
+
+- New live hotkey 'd' during playback cycles SCK/MOSI GPIO drive
+  capability 0→1→2→3 (msp3520_set_edge_drive(), gpio_drive_cap_t). The
+  compile-time LCD_EDGE_DRIVE_CAP block was removed (superseded).
+  Protocol: at a snowy 65–80 MHz step, press d repeatedly and watch which
+  drive setting (if any) clears the snow — weaker (0/1) = slower edges =
+  less ringing on jumper wires.
+- Combined with the §12 wiring levers (series-R on SCK, GND alongside
+  SCK, <100 mm wires) this is the complete remaining $0 experiment space
+  for 80 MHz. If none of it works, the module is definitively at its
+  ceiling (~10.5 fps) and 15 fps requires different hardware (§12.4).

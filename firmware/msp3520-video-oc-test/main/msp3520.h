@@ -99,6 +99,11 @@ bool msp3520_read_id(uint8_t raw_d3[6], uint8_t raw_04[6]);
 
 void msp3520_backlight(bool on);
 
+/* Live experiment: set SCK/MOSI GPIO drive capability (0=weakest..3=strongest
+ * edges, gpio_drive_cap_t). Player hotkey 'd' cycles it during playback —
+ * weaker edges may reduce ringing at 65-80 MHz. No effect below 40 MHz. */
+void msp3520_set_edge_drive(int cap);
+
 /* Fill the whole screen with one color (boot / blank screen). */
 esp_err_t msp3520_fill_screen(uint16_t color565);
 

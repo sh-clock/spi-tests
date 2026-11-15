@@ -130,7 +130,7 @@ static char poll_key(void)
             return 0;
         }
         char ch = (char)tolower((int)c);
-        if (strchr("ynrq", ch) != NULL) {
+        if (strchr("ynrqd", ch) != NULL) {
             /* echo + drain the rest of the line */
             printf("%c\n", ch);
             while (uart_read_bytes(CONSOLE_UART, &c, 1, pdMS_TO_TICKS(30)) == 1) {
@@ -246,6 +246,15 @@ static char play_segment(int seconds, uint32_t *frames_out, uint32_t *fps_x10)
 
         /* live keys: judge while watching, no need to wait for the end */
         char k = poll_key();
+        if (k == 'd') {
+            /* live experiment: cycle SCK/MOSI GPIO drive capability
+             * (weaker edges ring less on jumper wires — see README) */
+            static int s_drive = -1;      /* -1 = chip default, then 0..3 */
+            s_drive = (s_drive >= 3) ? 0 : s_drive + 1;
+            msp3520_set_edge_drive(s_drive);
+            printf("\n  [SCK/MOSI GPIO drive capability -> %d]\n", s_drive);
+            continue;
+        }
         if (k != 0) {
             *frames_out = frames;
             int64_t el = esp_timer_get_time() - t0;
@@ -261,7 +270,7 @@ static char play_segment(int seconds, uint32_t *frames_out, uint32_t *fps_x10)
                 ? (uint32_t)((uint64_t)frames * 10 * 1000000 / el) : 0;
             printf("\r  playing: %u frames, ", (unsigned)frames);
             print_x10(f10);
-            printf(" fps   [y/n/r/q]");
+            printf(" fps   [y/n/r/q/d=drive]");
             fflush(stdout);
             next_status += 500000;
         }

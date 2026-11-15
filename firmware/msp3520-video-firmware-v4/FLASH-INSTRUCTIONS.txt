@@ -1,4 +1,4 @@
-MSP3520 video player v4 (progressive block streaming) - flashable firmware
+MSP3520 video player v4.1 (adds the 80 MHz experiment hotkey) - flashable firmware
 ESP32-S3 (esp32s3) - ESP-IDF v6.1 - 2026-11-15
 THE FPS FIX: v3 sent every display line as 4 separate SPI transactions
 (1280 per frame, ~12 ms/frame of pure dead time - why you measured
@@ -28,8 +28,9 @@ WHAT TO EXPECT (S3 clock reality: 35-60 MHz requests run at 40 MHz,
     Last $0 experiment if you want to try anyway:
       1. series resistor 47-100 ohm on SCK at the ESP32 end (dampens
          reflections on the jumper wires), GND wire routed next to SCK
-      2. rebuild with LCD_EDGE_DRIVE_CAP 1 in main/msp3520.h (weaker
-         SCK/MOSI edges) - knob is in the source, off by default
+      2. NEW in v4.1: press d during playback - it cycles the SCK/MOSI
+         GPIO drive capability 0/1/2/3 live (weaker edges ring less).
+         Try each setting while the 80 MHz step plays.
       3. retest at 70/75/80 with the firmware's retest loop
     Expectation is low - the die is the limiter, not the wires.
 
