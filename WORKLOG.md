@@ -685,3 +685,86 @@ pushed. Bottom line for the project: 40 MHz remains the top sane clock
 on this wiring; 80 MHz remains the only step above it (4x the panel's
 spec, needs the §13 wiring levers). The 53.3/60 MHz dream dies here —
 not on wiring or drive strength, but in the S3's clock tree.
+## 19. (2026-11-15) video-lab: INTRO.mkv as a 15-technique testbed
+
+Owner request: new test video (INTRO.mkv, DVD rip, higher res/frame rate
+than the 15 fps game rip), cut to fit flash if needed; rewrite the
+firmware as a technique testbed with monitor-selectable playback
+(techniques 1-14 from the request, looping until another option is
+chosen), in a new repo folder; 40 MHz is the established safe clock.
+
+Sandbox note: this session's sandbox had rolled back to a near-fresh
+state (spi-tests, tools, scripts, download all gone locally). Recovered
+by re-cloning sh-clock/spi-tests (all §1-18 work was pushed), re-running
+idf_setup.sh (recreated), and reinstalling cmake/ninja via pip.
+
+Source: 720x480 anamorphic (SAR 8:9) MPEG-2, 29.97 fps, 12.0 s, AC3
+(ignored). Content is letterboxed 16:9 inside the 4:3 frame (bars
+47/51 px measured). Encoder chain: desqueeze to 640x480, crop bars,
+center-crop to 540 px (3:2, pan-and-scan — no geometry distortion so
+motion artifacts stay honest), scale to 480x320. Motion scan places the
+cut at t=8.47 s: 6 calm frames then the scene burst at t=8.67 s — the
+delta techniques get both regimes. 20 base frames.
+
+Codec (all techniques share it): 8-bit indexed frames + ONE global
+256-colour palette in RGB666 wire space (palette bytes ARE the wire
+bytes; firmware expands index->3 bytes via a 768 B DRAM LUT), 2x2 Bayer
+ordered dither, 3x3 median pre-filter (kills MPEG-2 noise; without it
+the dither+palette boundaries fragment every row). Mean decode error
+2.79/255. Six assets, 6.29 MB total (base 20f, pre_i4 6f x4 fields,
+half 12f 240-wide, third 12f 160-wide, delta.spans 12f, palette).
+
+Two encoder bugs found by the new host verifier (tools/verify_assets.py,
+which decodes every blob exactly like the firmware):
+1. A 15-bit colour-key cache added ±3.5/255 quantization slop (decode
+   error 21.96/255!) — replaced with exact 24-bit keys (2.79/255).
+2. Span deltas compared against the PREVIOUS frame let sub-tolerance
+   drift compound (frame 3 off by >2x the tolerance). Now the encoder
+   tracks the decoder's CANVAS and emits a pixel when its colour differs
+   from the canvas by >10/255 — drift is bounded forever (verified:
+   frame 0 exact, all later frames worst-case 8).
+
+Firmware (new folder firmware/msp3520-video-lab/, ~235 KB code):
+- msp3520.c extended with a queued-window session API (session_begin /
+  qcaset / qpaset / qramwr / qdata / drain_to / session_end) + a
+  wire-byte counter: CS stays LOW for a whole field while CASET/PASET/
+  RAMWR and pixel data are queued as DMA transactions (pre_cb flips D/C
+  per transaction). One window = 11 wire bytes (~0.8% of a row). This
+  is the queued answer to the v1-v3 per-line polling mistake.
+- 17 menu entries: 1/4/5/15 pure row interlace (ratio 4/8/3/2), 2/3
+  static scanlines (black clear once; even active rows, line-drop), 6
+  column 4:1 (1-px CASET windows; MADCTL already MV=1 so no register
+  change needed), 7a/7b quincunx (half-row windows, half = (y+field)&1),
+  8 macroblock 16x16 grid (run-grouped windows, full-frame fallback
+  above 66% dirty), 9 span delta (sequential cursor walk of
+  delta.spans), 10 LFSR (xorshift32 Fisher-Yates permutation, 80 rows
+  per field, reshuffled per cycle), 11a/11b pixel doubling (240/160-wide
+  sources stretched 2x/3x in the DMA buffer), 12 indexed full frame,
+  13 pre-interlaced pack (sequential fields, wire-identical to 1), 14
+  dual-core ping-pong (core 0 expands double buffers, core 1 queues to
+  SPI, FIFO-correct retire ordering — compare against 12), plus 'c'
+  (real lattice clocks 10/15/20/26.667/40) and 'i' (asset info).
+- Every player loops until any key, printing fields/s + MB/s every 2 s
+  and a final line on stop. Panel init is lazy (menu first — also
+  QEMU-friendly up to the first SPI transaction).
+- Triple line buffers + drain_to(8) keep two bursts in flight with
+  guaranteed-retired buffer reuse; the ping-pong consumer retires BOTH
+  in-flight blocks before CS goes high at field boundaries (a bug I
+  caught in review: FIFO retire order vs buffer release).
+
+Expected field rates at 40 MHz (RGB666, wire-limited): 57.6 KB -> ~60-70/s
+measured (86 max), 115.2 KB -> ~35-40 (43 max), 153.6 KB -> ~27-30,
+230.4 KB -> ~20, 460.8 KB -> ~10.5. Adaptive 8/9 swing live between
+calm (8-16 KB/field) and burst (96-151 KB).
+
+Verified in this session: clean build (6.53 MB app, 20% of the factory
+partition free), all asset checks passed (headers, palette, pre_i4 ==
+base rows, delta.spans round-trip within tolerance). Not verified:
+on-panel behaviour (no hardware here — the project flashes and reports
+its own stats on the real board; QEMU skipped since it cannot run SPI
+transactions, see §18).
+
+Deliverables: firmware/msp3520-video-lab/ (source + encoder + verifier
++ README, pushed), download/msp3520-video-lab/ (same, cleaned),
+download/msp3520-video-lab-firmware/ (bootloader + partition table +
+app + merged full image + FLASH-INSTRUCTIONS), both zipped.

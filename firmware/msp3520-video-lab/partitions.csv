@@ -1,0 +1,7 @@
+# Custom partition table: the ESP32-S3-DevKitC-1 carries 8 MB of flash and
+# this project stores all video assets INSIDE the application image, so the
+# factory app partition is grown to fill the chip (8 MB - 64 KiB).
+# Name,   Type, SubType,  Offset,  Size,     Flags
+nvs,      data, nvs,      0x9000,  0x6000,
+phy_init, data, phy,      0xf000,  0x1000,
+factory,  app, factory,  0x10000, 0x7F0000,
