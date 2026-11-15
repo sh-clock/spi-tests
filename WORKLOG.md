@@ -521,3 +521,99 @@ Next: the prototype board stays on v6. The dirty-rectangle generalization
 (v7) is the only remaining SPI-side fps project if wanted; the P4/DSI
 board removes the wire constraint entirely and inherits the blob codec
 plus everything above.
+## 17. v7 (2026-11-15) — dirty-rect fields + line dither
+
+Owner directive: implement the two research wins (dither + dirty-rect
+scheduling), answer the live-animation question, and CONSIDER (no
+implementation) "interlacing on steroids" — threading 3-4 frames together
+with dirty-rect on all of them.
+
+**Design (MIV3 blob, flags = bit2|bit3 = 12).** The ILI9488 GRAM persists,
+so a 16-line block is only stored/sent if its wire bytes differ from the
+previous field of the SAME half (field k-2). Each field starts with a
+little-endian u32 block bitmap (bit b = block b present) followed by only
+the present blocks' line data — clean blocks are not in the stream at all
+(no decode-and-discard). The player merges present blocks into contiguous
+RUNS; each run streams as one address window (CASET+PASET over the run's
+line range — new `msp3520_prepare_half_run()`) + one RAMWR session of
+16-line DMA blocks. A zero-bitmap field touches no SPI. Fields 0/1 are
+fully present (nothing precedes them), so loop restarts and the `r` key
+repaint the whole panel. The half for each field comes from
+`video_field_index()` parity — robust across restarts, unlike a
+player-side counter. MIV2 blobs still open: `video_next_field()` returns
+an all-present bitmap and consumes nothing, so v6 blobs play byte-for-byte
+like v6 (free A/B against the v6 package).
+
+**The dither saga (three attempts, all measurable).**
+1. Full 8x8 2D Bayer grain: best banding mask, but it breaks RLE runs down
+   to ~2 px (RLE stream 41.56 MB vs v6's 12.99) — blob 8.57 MB, past the
+   0x7F0000 app partition. Deeper LZSS chains cannot rescue periodic data
+   (the one-period-back match is always found first), so this is a hard
+   format limit, not a tuning issue.
+2. Mid-band gating (dither only residuals in [step/4, 3step/4)): barely
+   helped (40.33 MB) — this content's runs are naturally ~9 px, i.e. the
+   breakage population is textured gradient, not near-level flats.
+3. LINE dither (row-constant thresholds — first column of the Bayer
+   matrix, 8-row period, full ±step/2 amplitude): run boundaries stay
+   where the undithered level crossings are (just shifted per row), so
+   the RLE structure of v6 survives — PAL-style per-line error averaging
+   for vertical gradients, frame-stable, on-level rows never flip.
+   RLE 12.76 MB (SMALLER than v6: the dirty omission beats the dither
+   cost), LZ 5.81 MB, **blob 5,805,916 B (9.4x)**, app 6,037,264 B with
+   27% of the partition free. This is what ships.
+
+**Dirty stats on the Hill clip:** 3,300/3,460 blocks present (95.4%),
+8 fields completely empty (the duplicate halves created by sampling a
+15 fps source at 21.7 fields/s). Expected wire savings on THIS clip are
+modest (~5% + the empty fields); the mechanism pays off on static-heavy
+content, where fields collapse to bitmap-only. The live status line now
+shows fields/s AND actual bus utilization ("xx.x% bus" = wire bits /
+(elapsed x clock)) so the effect is visible while watching.
+
+**Gates (all PASS).**
+- Converter roundtrip: LZSS OK + a GRAM simulation that must equal the
+  intended half content after EVERY field (proves dirty detection AND
+  stream reassembly).
+- Host gate: the exact device decoder (video.c, compiled with gcc) walks
+  all 173 fields — 38,016,692 bytes byte-identical to the Python
+  reference walk (sha256 6eca12f2d2303e05) — and the C dump replayed
+  into a simulated panel equals the dithered source half after every
+  field.
+- v7 byte audit: driver patterns (MADCTL 0x28/COLMOD 0x66, no 0x55/0x48
+  regressions), half-window CASET table, key set "ynrqd", embedded MIV3
+  header (flags=12, fields=173), app under the partition limit, zips OK.
+- Lesson recorded: the first host-gate draft compared the FINAL gram
+  state against every field (only the last field per half could pass).
+  Per-field comparison is the only correct shape for dirty schedules.
+- QEMU: the post-recycle sandbox's qemu-xtensa (esp_develop_9.2.2_20260417)
+  stalls inside msp3520_init() after the boot banner — for the v7 image
+  AND for the hardware-validated v6 image booted from its package
+  (verified side by side), so it is an emulator regression in this
+  environment, not a firmware change. Boot-level checks pass under QEMU
+  (banner, MIV3 header parsed from flash mmap, FATAL paths clear); the
+  SPI-stage run is untestable here until a working qemu build returns.
+  As with v6 (which shipped without a QEMU gate), the host gates above
+  are the shipping authority.
+
+**Live animations (owner question).** Correct for the baked clip: the
+schedule is precomputed into the blob. But (a) on-device animation code
+knows what it changed — the v7 run-streaming primitive (window + RAMWR +
+blocks, `msp3520_prepare_half_run`) is exactly the API such a loop would
+call, LVGL-style; (b) live VIDEO with on-the-fly dirty detection is
+feasible if the board has PSRAM: keep the previous frame (460 KB), diff
+per 16-line block, send only changed runs — the blob format already has
+the vocabulary. That is a v8 candidate, not v7.
+
+**"Interlacing on steroids" (N-way threading) — considered, not built.**
+Threading N frames means splitting the field among N regions, each
+carrying a different temporal sample. The arithmetic is unforgiving:
+per-region refresh = 21.7/N Hz (N=3 -> 7.2 Hz, N=4 -> 5.4 Hz), below the
+~10 Hz floor where each region starts strobing on motion; N-1 seams each
+with a one-source-frame mismatch; and full-frame rate drops to 21.7/N.
+With dirty-rect on top, the frees are real but only for static regions —
+moving regions still need their full per-region rate. Verdict: N=2
+(v6/v7's halves) is the sweet spot for full-screen coverage on this bus;
+N>2 threading only becomes sane on the P4/DSI board where every region
+can hold >= 15-20 Hz. The RIGHT steroids on S3/SPI is what v7 now does:
+spend the fixed 21.7 Hz grid on what actually changed (content-adaptive
+temporal weaving), rather than statically slicing the screen N ways.

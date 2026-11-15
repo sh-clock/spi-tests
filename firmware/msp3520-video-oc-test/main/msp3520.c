@@ -387,18 +387,28 @@ esp_err_t msp3520_prepare_stream(void)
 
 esp_err_t msp3520_prepare_half_stream(int half)
 {
-    /* Half-width window for column-interlaced fields. MV=1 (LCD_MADCTL)
-     * makes CASET span the 480-px display axis, so a "half" is a 240-px
-     * column band; PASET stays full height. Every RAMWR after this starts
-     * at the half-window origin (datasheet §5.2.24: the column and page
-     * registers reset to SC/SP), and rows wrap inside the window exactly
-     * like the full-window case (§6.3). */
+    /* Half-width window for column-interlaced fields (v5/v6): the
+     * full-height special case (lines 0..319) of msp3520_prepare_half_run. */
+    return msp3520_prepare_half_run(half, 0, LCD_V_RES - 1);
+}
+
+esp_err_t msp3520_prepare_half_run(int half, int y0, int y1)
+{
+    /* v7 dirty runs: a 240-px half window covering ONLY lines y0..y1
+     * (inclusive). MV=1 (LCD_MADCTL) makes CASET span the 480-px display
+     * axis, so a "half" is a 240-px column band; PASET narrows it to the
+     * run's line range. Every RAMWR after this starts at the window
+     * origin (datasheet §5.2.24: the column and page registers reset to
+     * SC/SP), and rows wrap inside the window exactly like the full-window
+     * case (§6.3) — so a run of 16-line blocks streams as one RAMWR
+     * session of back-to-back DMA transactions. */
     static const uint8_t caset[2][4] = {
         { 0, 0,               0, (LCD_H_RES / 2) - 1 },               /* x 0..239   */
         { 0, LCD_H_RES / 2,   (LCD_H_RES - 1) >> 8, (LCD_H_RES - 1) & 0xFF }, /* 240..479 */
     };
-    const uint8_t paset[4] = { 0, 0, (LCD_V_RES - 1) >> 8, (LCD_V_RES - 1) & 0xFF };
-    if (half != 0 && half != 1) {
+    const uint8_t paset[4] = { (uint8_t)(y0 >> 8), (uint8_t)(y0 & 0xFF),
+                               (uint8_t)(y1 >> 8), (uint8_t)(y1 & 0xFF) };
+    if ((half != 0 && half != 1) || y0 < 0 || y1 < y0 || y1 >= LCD_V_RES) {
         return ESP_ERR_INVALID_ARG;
     }
     esp_err_t err = lcd_cmd(0x2A, caset[half], 4);

@@ -37,6 +37,9 @@ typedef struct {
     video_hdr_t    hdr;
     uint16_t       line_px;    /* pixels per RLE line: 480 progressive,
                                 * 240 field-halves (v6) */
+    bool           dirty;      /* MIV3: per-field block bitmaps, only
+                                * present blocks' data in the stream */
+    uint32_t       field_idx;  /* fields started so far (loop point) */
 } video_state_t;
 
 static video_state_t s;
@@ -117,7 +120,8 @@ bool video_open(const uint8_t *blob, uint32_t blob_len)
     /* memcpy: the packed struct may be unaligned-safe, but this way it is
      * guaranteed on every core (the blob lives in flash, mapped read-only) */
     memcpy(&s.hdr, blob, sizeof(video_hdr_t));
-    if (memcmp(s.hdr.magic, "MIV2", 4) != 0) {
+    if (memcmp(s.hdr.magic, "MIV2", 4) != 0
+        && memcmp(s.hdr.magic, "MIV3", 4) != 0) {
         return false;
     }
     if (s.hdr.width != 480 || s.hdr.height != 320) {
@@ -129,13 +133,15 @@ bool video_open(const uint8_t *blob, uint32_t blob_len)
     const uint16_t scan = s.hdr.flags & 0x6;
     if (scan != 0x2 && scan != 0x4) {
         return false;   /* need bit1 (progressive) or bit2 (field-halves);
-                         * bit2 is what the v6 player streams — main.c
+                         * bit2 is what the v6/v7 player streams — main.c
                          * rejects bit1 blobs with its own message */
     }
+    s.dirty = (scan == 0x4) && (s.hdr.flags & VIDEO_FLAG_DIRTY) != 0;
     s.line_px = (scan == 0x4) ? 240 : 480;
     s.src = blob + sizeof(video_hdr_t);
     s.src_len = blob_len - sizeof(video_hdr_t);
     lz_reset();
+    s.field_idx = 0;
     return true;
 }
 
@@ -144,9 +150,37 @@ const video_hdr_t *video_hdr(void)
     return &s.hdr;
 }
 
+uint32_t video_field_index(void)
+{
+    return s.field_idx;
+}
+
 void video_rewind(void)
 {
     lz_reset();
+    s.field_idx = 0;
+}
+
+bool video_next_field(uint32_t *bitmap)
+{
+    if (s.field_idx >= s.hdr.fields) {
+        return false;                     /* loop point: caller rewinds */
+    }
+    s.field_idx++;
+    if (!s.dirty) {
+        *bitmap = 0xFFFFFFFFu;            /* MIV2: every block present */
+        return true;
+    }
+    /* MIV3: the field starts with its little-endian u32 block bitmap */
+    uint8_t b[4];
+    for (int i = 0; i < 4; i++) {
+        if (!lz_byte(&b[i])) {
+            return false;                 /* truncated stream */
+        }
+    }
+    *bitmap = (uint32_t)b[0] | (uint32_t)b[1] << 8
+            | (uint32_t)b[2] << 16 | (uint32_t)b[3] << 24;
+    return true;
 }
 
 bool video_read_line(uint8_t *dst)

@@ -1,0 +1,53 @@
+MSP3520 v7 video firmware - DIRTY-RECT + DITHER
+================================================
+ESP32-S3 (esp32s3) - ESP-IDF v6.1.0 - built 2026-11-15
+Layout: video embedded in the app, 8 MB flash (DevKitC-1 N8 / N8R2 /
+N16 all work).
+
+WHAT'S NEW IN v7 (vs the v6 you validated)
+  - DIRTY-RECT SCHEDULE: each field carries only the 16-line blocks
+    that changed vs the previous field of the same screen half — the
+    ILI9488 keeps the rest in its GRAM. Wire bytes now follow motion:
+    static scenes idle the bus. On the Hill clip (nearly everything
+    moves) that is ~5% fewer wire bytes plus 8 fully skipped duplicate
+    fields; on static-heavy content the savings are far larger.
+  - LINE DITHER: pixels are dithered offline before the RGB666
+    quantizer with row-constant Bayer thresholds (PAL-style per-line
+    error averaging) — gradient banding becomes fine, frame-stable
+    texture (look at the sky).
+  - The live status line now shows bus utilization ("xx.x% bus").
+  - Field cadence, keys and the clock sweep are unchanged from v6
+    (~21.7 fields/s at 40 MHz; y clean / n artifacts / r restart /
+    q quit / d GPIO drive cap).
+
+FILES
+  bootloader.bin                 flash at 0x0
+  partition-table.bin            flash at 0x8000
+  msp3520_video_oc_test.bin      flash at 0x10000  (6 MB - the video is in it, blob 6 MB)
+  msp3520_video_oc_test_full.bin all three merged - flash at 0x0 (easiest)
+
+FLASH IT (pick your COM port; no --flash-mode/--flash-size/--flash-freq
+flags needed - the image already carries the right settings):
+  C:\Espressif\tools\python\v6.1\venv\Scripts\python.exe -m esptool --chip esp32s3 -p COM10 -b 460800 --before default-reset --after hard-reset write-flash 0x0 msp3520_video_oc_test_full.bin
+  Flashing the 6 MB image takes a while - that is the video going in.
+
+WHICH USB PORT? EITHER ONE WORKS
+  - "COM/UART" port (CP210x bridge): "Silicon Labs CP210x ... (COMx)"
+    in Device Manager (install the Silicon Labs driver if missing).
+  - The native USB port works too; the console is mirrored on both.
+
+WHAT YOU SHOULD SEE
+  Screen: a dark blue boot screen, then your Hill video playing
+  fullscreen LANDSCAPE (480x320), starting at the 10 MHz sweep step.
+  Console: the banner
+    "MSP3520 VIDEO player + SPI clock sweep (v7, DIRTY-RECT)"
+  then "[ 1/15] 10 MHz" and a live line like
+    "playing: 45 fields, 9.8 fields/s, 98.0% bus   [y/n/r/q/d]".
+  At 40 MHz: ~21.7 fields/s; the bus % drops whenever the scene holds
+  still — that is the dirty schedule skipping unchanged blocks.
+  A/B vs v6: flash the v6 package (msp3520-video-firmware-v6) — same
+  clip, same cadence; v7 differs by the dither grain and the bus %.
+
+WIRING (unchanged)
+  CS GPIO10, DC GPIO9, RESET GPIO14, MOSI GPIO11, SCK GPIO12,
+  backlight GPIO47, VCC 3.3V (or 5V), GND. Touch pins not connected.

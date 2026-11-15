@@ -128,6 +128,14 @@ esp_err_t msp3520_prepare_stream(void);
  * msp3520_queue_half_block() calls + msp3520_field_end(). */
 esp_err_t msp3520_prepare_half_stream(int half);
 
+/* v7 dirty runs: set the address window to a LINE RANGE of one 240-px half
+ * (y0..y1 inclusive, full half width) — one contiguous run of present
+ * 16-line blocks. Streaming a run is exactly like streaming a whole
+ * half-frame: msp3520_field_begin() + N x msp3520_queue_half_block() +
+ * msp3520_field_end(), with the row pointer wrapping inside the window.
+ * The data sent must exactly fill the window (N * 16 half-width lines). */
+esp_err_t msp3520_prepare_half_run(int half, int y0, int y1);
+
 /* Queue one block of LCD_BLOCK_LINES consecutive half-window lines
  * (LCD_BLOCK_LINES * LCD_H_RES/2 * wire_bpp bytes) as one DMA transaction.
  * Same in-flight/retire rules as msp3520_queue_block(). */

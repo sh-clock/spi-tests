@@ -1,5 +1,5 @@
 /*
- * main.c — MSP3520 field-interlaced video player + SPI clock sweep (v6).
+ * main.c — MSP3520 field-interlaced video player + SPI clock sweep (v7).
  *
  * Plays the converted video (embedded video.bin, 480x320) as FIELD-NATIVE
  * half-frames: each field is one 240-px half of the display (left x 0..239,
@@ -8,16 +8,26 @@
  * straight from the decoder into 16-line half-window DMA blocks: no PSRAM
  * stage, no full frame ever exists in RAM.
  *
- * Why: a full RGB666 frame is 460,800 B; the 40 MHz bus tops out at ~10.85
- * full frames/s. A half-frame is 230,400 B, so the same bus carries ~21.7
- * fields/s — and because every field carries a FRESH source sample, motion
- * advances at ~21.7 steps/s instead of ~10.85. The trade (accepted): each
- * field is half the picture, so there is a stationary mid-screen seam and
- * fast pans shear across it (~1 field period of motion); static content is
- * pixel-identical to progressive playback. This is the classic interlace
- * trade realized in the only wire-cheap shape the ILI9488 offers: contiguous
- * half-windows (true even/odd row interlace would need a CASET+PASET+RAMWR
- * per line — 1280 transactions/frame, the mistake v1-v3 made).
+ * v7 adds the DIRTY schedule (blob flags bit3): each field starts with a
+ * block bitmap and carries ONLY the 16-line blocks whose wire bytes differ
+ * from the previous field that wrote the same half (field k-2) — the
+ * ILI9488 GRAM persists, so unchanged blocks are simply not re-sent (and
+ * not even stored in the blob). Present blocks are grouped into contiguous
+ * runs; each run is one address window + one RAMWR session. Static scenes
+ * leave the bus idle; the status line shows the live bus utilization.
+ * The pixel data itself is Bayer 8x8 dithered offline before the RGB666
+ * quantizer (banding -> fine frame-stable grain).
+ *
+ * Why interlace at all: a full RGB666 frame is 460,800 B; the 40 MHz bus
+ * tops out at ~10.85 full frames/s. A half-frame is 230,400 B, so the same
+ * bus carries ~21.7 fields/s — and because every field carries a FRESH
+ * source sample, motion advances at ~21.7 steps/s instead of ~10.85. The
+ * trade (accepted): each field is half the picture, so there is a
+ * stationary mid-screen seam and fast pans shear across it (~1 field
+ * period of motion). This is the classic interlace trade realized in the
+ * only wire-cheap shape the ILI9488 offers: contiguous half-windows (true
+ * even/odd row interlace would need a CASET+PASET+RAMWR per line — 1280
+ * transactions/frame, the mistake v1-v3 made).
  *
  * The sweep runs the SAME video at 10..80 MHz SPI clock, 5 MHz steps. At
  * each frequency the video loops for PLAY_SECONDS while you watch; press
@@ -171,48 +181,74 @@ typedef struct {
 static step_t s_steps[STEP_COUNT];
 
 /* Push one field: a 240-px half-window (half=0 left x 0..239, half=1 right
- * x 240..479), full height, streamed straight from the decoder in 16-line
- * DMA blocks — no PSRAM, no staging, ~23 SPI transactions per field.
+ * x 240..479) carrying only the blocks named in the bitmap (bit b = 16-line
+ * block b of this half). The ILI9488 GRAM keeps whatever the previous
+ * same-half field wrote, so clean blocks are simply not re-sent. Present
+ * blocks are grouped into contiguous runs; each run is one address window
+ * (msp3520_prepare_half_run) + one RAMWR session of 16-line DMA blocks.
+ * bitmap == 0 (nothing changed) touches no SPI at all. MIV2 blobs report
+ * an all-present bitmap, so they stream exactly like v6.
  * Returns false only if the video decoder hard-fails (corrupt blob). */
-static bool push_field(int half)
+static bool push_field(int half, uint32_t bitmap)
 {
     const video_hdr_t *hdr = video_hdr();
     const size_t half_stride = (size_t)(LCD_H_RES / 2) * hdr->bpp;  /* 720 */
+    const uint32_t present = bitmap & ((1u << FRAME_BLOCKS) - 1u);
 
-    ESP_ERROR_CHECK(msp3520_prepare_half_stream(half));
-    ESP_ERROR_CHECK(msp3520_field_begin());      /* CS low + RAMWR */
-    int live = 0;
-    for (int b = 0; b < FRAME_BLOCKS; b++) {     /* 20 x 16 lines = 320 */
-        uint8_t *dst = s_block[b & (TX_BLOCKS_IN_FLIGHT - 1)];
-        for (int l = 0; l < LCD_BLOCK_LINES; l++) {
-            if (!video_read_line(dst + (size_t)l * half_stride)) {
-                /* end of the video inside a field cannot happen (the blob
-                 * ends on field boundaries), but be safe and restart */
-                video_rewind();
+    if (present == 0) {
+        return true;               /* GRAM already holds this field */
+    }
+    int b = 0;
+    while (b < FRAME_BLOCKS) {
+        if (!(present & (1u << b))) {
+            b++;
+            continue;
+        }
+        int e = b;                 /* extend to the end of the run */
+        while (e + 1 < FRAME_BLOCKS && (present & (1u << (e + 1)))) {
+            e++;
+        }
+        ESP_ERROR_CHECK(msp3520_prepare_half_run(
+            half, b * LCD_BLOCK_LINES, (e + 1) * LCD_BLOCK_LINES - 1));
+        ESP_ERROR_CHECK(msp3520_field_begin());      /* CS low + RAMWR */
+        int live = 0;
+        int i_tx = 0;
+        for (int blk = b; blk <= e; blk++) {
+            /* buffers alternate by QUEUE order (FIFO retire discipline),
+             * not by block index — runs start at arbitrary blocks */
+            uint8_t *dst = s_block[i_tx & (TX_BLOCKS_IN_FLIGHT - 1)];
+            i_tx++;
+            for (int l = 0; l < LCD_BLOCK_LINES; l++) {
                 if (!video_read_line(dst + (size_t)l * half_stride)) {
-                    /* corrupt blob: drain + CS high so the panel and the
-                     * SPI queue are in a clean state for the next step */
-                    while (live > 0) {
-                        msp3520_retire_block();
-                        live--;
+                    /* end of the video inside a field cannot happen (the
+                     * blob ends on field boundaries), but be safe */
+                    video_rewind();
+                    if (!video_read_line(dst + (size_t)l * half_stride)) {
+                        /* corrupt blob: drain + CS high so the panel and
+                         * the SPI queue are in a clean state */
+                        while (live > 0) {
+                            msp3520_retire_block();
+                            live--;
+                        }
+                        msp3520_field_end();
+                        return false;
                     }
-                    msp3520_field_end();
-                    return false;
                 }
             }
+            /* a half block is 11,520 B; the s_block rows hold 23,040 B */
+            ESP_ERROR_CHECK(msp3520_queue_half_block(dst));
+            if (++live >= TX_BLOCKS_IN_FLIGHT) {
+                ESP_ERROR_CHECK(msp3520_retire_block());
+                live--;
+            }
         }
-        /* a half block is 11,520 B; the s_block rows hold 23,040 B */
-        ESP_ERROR_CHECK(msp3520_queue_half_block(dst));
-        if (++live >= TX_BLOCKS_IN_FLIGHT) {
+        while (live > 0) {
             ESP_ERROR_CHECK(msp3520_retire_block());
             live--;
         }
+        msp3520_field_end();
+        b = e + 1;
     }
-    while (live > 0) {
-        ESP_ERROR_CHECK(msp3520_retire_block());
-        live--;
-    }
-    msp3520_field_end();
     return true;
 }
 
@@ -247,9 +283,9 @@ static void pace_until(int64_t target_us)
  * the time simply ran out. Fills *fields_out and *rate_x10 (fields/s x10). */
 static char play_segment(int seconds, uint32_t *fields_out, uint32_t *rate_x10)
 {
-    const video_hdr_t *hdr = video_hdr();
     uint32_t fields = 0;
-    uint32_t field = 0;                 /* field index 0..hdr->fields-1 */
+    uint32_t blocks = 0;               /* dirty blocks pushed to the panel */
+    uint64_t wire_bytes = 0;           /* pixel bytes pushed to the panel */
     int64_t t0 = esp_timer_get_time();
     int64_t deadline = t0 + (int64_t)seconds * 1000000;
     int64_t next_status = t0 + 500000;
@@ -260,16 +296,31 @@ static char play_segment(int seconds, uint32_t *fields_out, uint32_t *rate_x10)
             break;
         }
 
-        /* stream one field: even index = left half, odd = right half */
-        if (!push_field((int)(field & 1u))) {
+        /* start the next field; at the loop point start over. Field 0 is
+         * fully present (nothing precedes it), so a rewind repaints the
+         * whole panel cleanly. */
+        uint32_t bitmap;
+        uint32_t fidx = video_field_index();
+        if (!video_next_field(&bitmap)) {
+            video_rewind();
+            fidx = 0;
+            if (!video_next_field(&bitmap)) {
+                break;                 /* pathological: empty blob */
+            }
+        }
+
+        /* stream the field: even index = left half, odd = right half;
+         * only the blocks named in the bitmap go on the wire */
+        if (!push_field((int)(fidx & 1u), bitmap)) {
             break;
         }
-        fields++;
-        field++;
-        if (field >= hdr->fields) {
-            field = 0;                  /* loop the video */
-            video_rewind();
+        {
+            uint32_t n = (uint32_t)__builtin_popcount(
+                bitmap & ((1u << FRAME_BLOCKS) - 1u));
+            blocks += n;
+            wire_bytes += (uint64_t)n * LCD_HALF_BLOCK_BYTES;
         }
+        fields++;
 
         /* real time: 21.70 fields/s when the bus keeps up (matches the
          * converter's --field-rate bake) */
@@ -299,9 +350,16 @@ static char play_segment(int seconds, uint32_t *fields_out, uint32_t *rate_x10)
             int64_t el = now - t0;
             uint32_t f10 = el > 0
                 ? (uint32_t)((uint64_t)fields * 10 * 1000000 / el) : 0;
+            /* share of the SPI bus actually carrying pixels (x10 %):
+             * wire bits / (elapsed us * clock Hz) */
+            uint64_t capacity = (uint64_t)((uint64_t)el) * msp3520_get_clock();
+            uint32_t util10 = capacity > 0
+                ? (uint32_t)(wire_bytes * 80 / capacity) : 0;
             printf("\r  playing: %u fields, ", (unsigned)fields);
             print_x10(f10);
-            printf(" fields/s   [y/n/r/q/d]");
+            printf(" fields/s, ");
+            print_x10(util10);
+            printf("%% bus   [y/n/r/q/d]");
             fflush(stdout);
             next_status += 500000;
         }
@@ -496,7 +554,7 @@ static void print_banner(const video_hdr_t *hdr)
 
     printf("\n");
     printf("  ============================================================\n");
-    printf("   MSP3520 VIDEO player + SPI clock sweep (v6, FIELD-INTERLACED)\n");
+    printf("   MSP3520 VIDEO player + SPI clock sweep (v7, DIRTY-RECT)\n");
     printf("   ESP32-S3 + ESP-IDF  |  sweep %d..%d MHz in %d MHz steps\n",
            FREQ_START_MHZ, FREQ_STOP_MHZ, FREQ_STEP_MHZ);
     printf("  ============================================================\n");
@@ -513,12 +571,20 @@ static void print_banner(const video_hdr_t *hdr)
     printf("  reality: 35-60 MHz requests run at 40 MHz, 65-80 MHz at\n");
     printf("  80 MHz (no other steps exist).\n");
     printf("  FIELD-INTERLACED streaming: 16-line DMA blocks into\n");
-    printf("  alternating half-windows (~23 SPI transactions per field).\n");
-    printf("  No PSRAM needed. At 40 MHz expect ~21.7 fields/s (vs ~10.85\n");
-    printf("  full frames/s progressive): every field carries a newer\n");
-    printf("  source sample, so motion advances at double cadence. Trade:\n");
-    printf("  a stationary mid-screen seam; fast pans shear across it by\n");
-    printf("  ~1 field period. Static content: identical to progressive.\n");
+    printf("  alternating half-windows, one address window + RAMWR per\n");
+    printf("  contiguous dirty run. No PSRAM needed. Field cadence is\n");
+    printf("  ~21.7 fields/s at 40 MHz (vs ~10.85 full frames/s):\n");
+    printf("  every field carries a newer source sample, so motion\n");
+    printf("  advances at double cadence.\n");
+    printf("  V7 DIRTY SCHEDULE: a field only carries the 16-line blocks\n");
+    printf("  that changed vs the previous field of the same half — the\n");
+    printf("  ILI9488 GRAM keeps the rest. Wire bytes follow motion;\n");
+    printf("  static scenes idle the bus (status line shows bus %%).\n");
+    printf("  V7 DITHER: pixels are Bayer 8x8 dithered offline before\n");
+    printf("  the RGB666 quantizer — gradient banding becomes fine,\n");
+    printf("  frame-stable grain.\n");
+    printf("  Trade: a stationary mid-screen seam; fast pans shear across\n");
+    printf("  it by ~1 field period. Static content: identical halves.\n");
     printf("  Noise, torn stripes, wrong colors or freezes\n");
     printf("  are NOT normal - press n.\n");
     printf("\n");
@@ -547,9 +613,10 @@ void app_main(void)
     if ((video_hdr()->flags & 0x4) == 0) {
         /* video_open also accepts progressive blobs (flags bit1) so the
          * decoder stays testable — but THIS player streams fields */
-        printf("  FATAL: v6 streams FIELD-INTERLACED blobs (flags bit2).\n"
+        printf("  FATAL: v7 streams FIELD-INTERLACED blobs (flags bit2).\n"
                "  Regenerate video.bin with:\n"
-               "    tools/convert_video.py IN.mp4 main/video.bin --scan field-halves\n");
+               "    tools/convert_video.py IN.mp4 main/video.bin \\\n"
+               "        --scan field-halves --dither --dirty\n");
         return;
     }
     print_banner(video_hdr());
