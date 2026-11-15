@@ -18,13 +18,14 @@ OUT = "/tmp/c_decoded_lines.bin"
 blob = open(BLOB, "rb").read()
 hdr = struct.unpack("<4sHHHHIII", blob[:24])
 magic, W, H, frames, flags, rle_len, fields, bpp = hdr
+unit_lines = H if (flags & 2) else H // 2
 print(f"blob: {len(blob)} bytes  hdr={magic} {W}x{H} frames={frames} "
       f"fields={fields} rle_len={rle_len}")
 
 # reference: LZSS decode -> RLE expand
 lz = blob[24:]
 dec = lzss_decode(lz, rle_len)
-expected = rle_expand_stream(dec, fields, H // 2, bpp)
+expected = rle_expand_stream(dec, fields, unit_lines, bpp)
 print(f"reference expansion: {len(expected)} bytes, "
       f"sha256={hashlib.sha256(expected).hexdigest()[:16]}")
 

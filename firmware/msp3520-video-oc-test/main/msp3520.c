@@ -6,13 +6,15 @@
  *  - D/C is set by lcd_pre_cb (the SPI driver invokes it right before each
  *    transaction, polled or queued). t->user == 1 means "data phase" (D/C
  *    high), NULL means "command byte" (D/C low).
- *  - msp3520_queue_line() queues FOUR transactions per display line
- *    (PASET cmd, PASET params, RAMWR cmd, 960 B pixels) and returns
- *    immediately; DMA pushes them while the CPU decodes the next line.
+ *  - msp3520_queue_block() queues ONE 16-line DMA transaction (23,040 B
+ *    with RGB666) and returns immediately; DMA pushes it while the CPU
+ *    decodes the next block.
  *
- * A field (one interlaced half-frame = 160 display lines of one parity) is
- * pushed with CS held LOW the whole time, so the panel sees one continuous
- * burst of PASET/RAMWR/line/PASET/RAMWR/line/...
+ * A frame is pushed with CS held LOW the whole time: one RAMWR (polled,
+ * inside msp3520_field_begin) followed by 20 pure-data block transactions.
+ * The panel sees one continuous burst of pixels — no per-line addressing
+ * (the v1-v3 per-line protocol needed 4 transactions per line = 1280 per
+ * frame; that overhead cost ~12 ms/field at 40 MHz).
  */
 #include <string.h>
 #include "freertos/FreeRTOS.h"
@@ -25,8 +27,8 @@
 #define LCD_SAFE_CLOCK_HZ   1000000
 #define LCD_SPI_HOST        SPI2_HOST
 
-/* Transaction ring: one queued line uses 4 slots; with
- * TX_LINES_IN_FLIGHT == 2 at most 8 slots are live at any time. */
+/* Transaction ring: one queued block uses 1 slot; with
+ * TX_BLOCKS_IN_FLIGHT == 2 at most 2 slots are live at any time. */
 #define TX_RING_SLOTS 16
 
 static spi_device_handle_t s_spi;
@@ -137,6 +139,12 @@ esp_err_t msp3520_init(void)
     if (err != ESP_OK) {
         return err;
     }
+
+#if LCD_EDGE_DRIVE_CAP >= 0
+    /* optional edge-rate experiment (see msp3520.h) */
+    gpio_set_drive_capability(LCD_PIN_SCLK, (gpio_drive_cap_t)LCD_EDGE_DRIVE_CAP);
+    gpio_set_drive_capability(LCD_PIN_MOSI, (gpio_drive_cap_t)LCD_EDGE_DRIVE_CAP);
+#endif
 
     const spi_bus_config_t buscfg = {
         .sclk_io_num     = LCD_PIN_SCLK,
@@ -355,42 +363,42 @@ int msp3520_get_wire_bpp(void)
 
 esp_err_t msp3520_prepare_stream(void)
 {
-    /* Column window for the whole frame; the controller keeps it across
-     * RAMWRs, so line writes only need their own row window (PASET). */
+    /* Full-display window (CASET + PASET). The controller wraps rows inside
+     * the window, so the whole frame can then be streamed as pure pixel
+     * data — no per-line addressing on the wire. */
     const uint8_t caset[4] = { 0, 0, (LCD_H_RES - 1) >> 8, (LCD_H_RES - 1) & 0xFF };
-    return lcd_cmd(0x2A, caset, 4);
-}
-
-void msp3520_field_begin(void)
-{
-    lcd_cs_low();
-}
-
-esp_err_t msp3520_queue_line(uint16_t y, const uint8_t *line_bytes)
-{
-    const uint8_t paset      = 0x2B;
-    const uint8_t params[4]  = { y >> 8, y & 0xFF, y >> 8, y & 0xFF };
-    const uint8_t ramwr      = 0x2C;
-    esp_err_t err;
-
-    err = lcd_queue(&paset, 1, false);
-    if (err != ESP_OK) return err;
-    err = lcd_queue(params, 4, true);
-    if (err != ESP_OK) return err;
-    err = lcd_queue(&ramwr, 1, false);
-    if (err != ESP_OK) return err;
-    return lcd_queue(line_bytes, (size_t)LCD_H_RES * (size_t)s_wire_bpp, true);
-}
-
-esp_err_t msp3520_retire_line(void)
-{
-    for (int i = 0; i < 4; i++) {
-        esp_err_t err = lcd_retire();
-        if (err != ESP_OK) {
-            return err;
-        }
+    const uint8_t paset[4] = { 0, 0, (LCD_V_RES - 1) >> 8, (LCD_V_RES - 1) & 0xFF };
+    esp_err_t err = lcd_cmd(0x2A, caset, 4);
+    if (err != ESP_OK) {
+        return err;
     }
-    return ESP_OK;
+    return lcd_cmd(0x2B, paset, 4);
+}
+
+esp_err_t msp3520_field_begin(void)
+{
+    /* CS low + RAMWR: opens a frame write. The address pointer resets to
+     * the window start (row 0) and keeps advancing while CS stays low. */
+    const uint8_t ramwr = 0x2C;
+    lcd_cs_low();
+    return lcd_poll(&ramwr, 1, false);
+}
+
+esp_err_t msp3520_queue_block(const uint8_t *block_bytes)
+{
+    /* pure pixel data: the window was set by msp3520_prepare_stream() and
+     * the write session opened by msp3520_field_begin() (RAMWR). The
+     * controller wraps rows inside the window and keeps consuming bytes
+     * while CS stays low, so blocks are just back-to-back DMA transactions
+     * — 1 RAMWR + 20 blocks per frame instead of 4 transactions per line. */
+    return lcd_queue(block_bytes,
+                     (size_t)LCD_BLOCK_LINES * LCD_H_RES * (size_t)s_wire_bpp,
+                     true);
+}
+
+esp_err_t msp3520_retire_block(void)
+{
+    return lcd_retire();
 }
 
 void msp3520_field_end(void)
@@ -398,54 +406,46 @@ void msp3520_field_end(void)
     lcd_cs_high();
 }
 
-/* Push `lines` identical lines starting at row `y0` (used by fill_screen and
- * available to the player for solid-color areas). */
-static esp_err_t push_lines(uint16_t y0, uint16_t lines, const uint8_t *line)
-{
-    esp_err_t err;
-
-    if (lines == 0) {
-        return ESP_OK;
-    }
-    msp3520_field_begin();
-    for (uint16_t k = 0; k < lines; k++) {
-        err = msp3520_queue_line(y0 + k, line);
-        if (err != ESP_OK) return err;
-        if (k >= TX_LINES_IN_FLIGHT - 1) {
-            err = msp3520_retire_line();
-            if (err != ESP_OK) return err;
-        }
-    }
-    err = msp3520_retire_line();     /* drain the last line */
-    if (err != ESP_OK) return err;
-    msp3520_field_end();
-    return ESP_OK;
-}
-
 esp_err_t msp3520_fill_screen(uint16_t color565)
 {
-    static uint8_t line[LCD_LINE_BYTES_MAX];
+    static uint8_t block[LCD_BLOCK_BYTES];
+    const size_t stride = (size_t)LCD_H_RES * (size_t)s_wire_bpp;
 
+    /* build one line, then replicate it into a 16-line block */
     if (s_wire_bpp == 3) {
         uint8_t rgb[3];
         lcd_rgb565_to_666(color565, rgb);
         for (int x = 0; x < LCD_H_RES; x++) {
-            line[x * 3 + 0] = rgb[0];
-            line[x * 3 + 1] = rgb[1];
-            line[x * 3 + 2] = rgb[2];
+            block[x * 3 + 0] = rgb[0];
+            block[x * 3 + 1] = rgb[1];
+            block[x * 3 + 2] = rgb[2];
         }
     } else {
         uint8_t px[2];
         lcd_rgb565_to_be16(color565, px);
         for (int x = 0; x < LCD_H_RES; x++) {
-            line[x * 2 + 0] = px[0];
-            line[x * 2 + 1] = px[1];
+            block[x * 2 + 0] = px[0];
+            block[x * 2 + 1] = px[1];
         }
+    }
+    for (int l = 1; l < LCD_BLOCK_LINES; l++) {
+        memcpy(block + l * stride, block, stride);
     }
 
     esp_err_t err = msp3520_prepare_stream();
     if (err != ESP_OK) {
         return err;
     }
-    return push_lines(0, LCD_V_RES, line);
+    err = msp3520_field_begin();
+    if (err != ESP_OK) {
+        return err;
+    }
+    for (int b = 0; b < LCD_V_RES / LCD_BLOCK_LINES; b++) {
+        err = msp3520_queue_block(block);
+        if (err != ESP_OK) return err;
+        err = msp3520_retire_block();    /* boot-time fill: no pipelining */
+        if (err != ESP_OK) return err;
+    }
+    msp3520_field_end();
+    return ESP_OK;
 }

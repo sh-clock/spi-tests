@@ -96,13 +96,14 @@ def to_rgb666(frames):
 
 
 # ---------------------------------------------------------------- step 4-5
-def build_rle_stream(frames_wire):
-    """interlaced fields -> one long RLE byte stream"""
+def build_rle_stream(frames_wire, progressive=True):
+    """display lines -> one long RLE byte stream (frame- or field-sliced)"""
     n = frames_wire.shape[0]
     stream = bytearray()
     for i in range(n):
         f = frames_wire[i]
-        for field in (f[0::2], f[1::2]):          # 160 lines each
+        units = (f,) if progressive else (f[0::2], f[1::2])
+        for field in units:
             for line in field:
                 same = np.all(line[1:] == line[:-1], axis=1)
                 breaks = np.where(~same)[0] + 1
@@ -115,7 +116,8 @@ def build_rle_stream(frames_wire):
                         c = min(L, 256)
                         stream += bytes((c - 1,)) + px
                         L -= c
-    print(f"step4+5: {n} frames = {n*2} fields, RLE stream "
+    n_units = n if progressive else n * 2
+    print(f"step4+5: {n} frames = {n_units} units, RLE stream "
           f"{len(stream)/1e6:.2f} MB")
     return bytes(stream)
 
@@ -286,6 +288,10 @@ def main():
                     help="wire bytes/pixel: 3 = RGB666 (ILI9488 SPI, the "
                          "default) or 2 = RGB565 (parallel-interface panels "
                          "only — blank screen on native SPI)")
+    ap.add_argument("--scan", choices=("progressive", "interlaced"),
+                    default="progressive",
+                    help="progressive = whole frames (v4 player, default); "
+                         "interlaced = even/odd fields (legacy v1-v3 blobs)")
     ap.add_argument("--chain", type=int, default=24,
                     help="LZSS match chain length (deeper = smaller/slower)")
     ap.add_argument("--store", type=int, default=48,
@@ -296,15 +302,18 @@ def main():
     global BPP
     BPP = args.bpp
     frames_wire = to_rgb565(frames) if BPP == 2 else to_rgb666(frames)
-    stream = build_rle_stream(frames_wire)
+    progressive = args.scan == "progressive"
+    stream = build_rle_stream(frames_wire, progressive)
     print("step6: LZSS encoding (this takes a minute) ...")
     sys.stdout.flush()
     lz = lzss_encode(stream, args.chain, args.store)
     n_frames = frames_wire.shape[0]
 
+    flags = 2 if progressive else 0
+    n_units = n_frames if progressive else n_frames * 2
     hdr = struct.pack("<4sHHHHII I".replace(" ", ""),
-                      b"MIV2", W, H, n_frames, 0,
-                      len(stream), n_frames * 2, BPP)
+                      b"MIV2", W, H, n_frames, flags,
+                      len(stream), n_units, BPP)
     blob = hdr + lz
     with open(args.output, "wb") as f:
         f.write(blob)
@@ -323,7 +332,7 @@ def main():
     assert dec == stream, "LZSS ROUNDTRIP FAILED"
     print("  LZSS OK")
     print("verify: RLE expansion ...", flush=True)
-    lines = rle_expand_stream(dec, n_frames * 2, H // 2)
+    lines = rle_expand_stream(dec, n_units, H if progressive else H // 2)
 
     def interleave(field_even, field_odd):
         """two 160-line fields -> one 320-line frame (bytes)"""
@@ -335,18 +344,26 @@ def main():
         fr[1::2] = od
         return fr
 
-    f0 = interleave(lines[0:(H // 2) * W * BPP],
-                    lines[(H // 2) * W * BPP:H * W * BPP])
+    if progressive:
+        f0 = np.frombuffer(lines[0:H * W * BPP],
+                           dtype=np.uint8).reshape(H, W * BPP)
+    else:
+        f0 = interleave(lines[0:(H // 2) * W * BPP],
+                        lines[(H // 2) * W * BPP:H * W * BPP])
     assert f0.tobytes() == frames_wire[0].reshape(H, W * BPP).tobytes(), \
         "RLE EXPANSION FAILED"
-    print("  RLE + interlace reconstruction OK (frame 0 byte-identical)")
+    print("  RLE reconstruction OK (frame 0 byte-identical)")
 
     W3 = W * BPP
-    allexp = np.empty((n_frames, H, W3), dtype=np.uint8)
-    for fi in range(n_frames):
-        base = fi * H * W3
-        allexp[fi] = interleave(lines[base:base + (H // 2) * W3],
-                                lines[base + (H // 2) * W3:base + H * W3])
+    if progressive:
+        # progressive: the stream is already whole frames in order
+        allexp = np.frombuffer(lines, dtype=np.uint8).reshape(n_frames, H, W3)
+    else:
+        allexp = np.empty((n_frames, H, W3), dtype=np.uint8)
+        for fi in range(n_frames):
+            base = fi * H * W3
+            allexp[fi] = interleave(lines[base:base + (H // 2) * W3],
+                                    lines[base + (H // 2) * W3:base + H * W3])
     assert allexp.tobytes() == frames_wire.reshape(n_frames, H, W3).tobytes(), \
         "FULL EXPANSION FAILED"
     print(f"  all {n_frames} frames byte-identical — converter verified")

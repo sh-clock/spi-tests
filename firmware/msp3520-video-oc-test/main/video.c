@@ -124,6 +124,9 @@ bool video_open(const uint8_t *blob, uint32_t blob_len)
     if (s.hdr.bpp != 2 && s.hdr.bpp != 3) {
         return false;                            /* 2 = RGB565, 3 = RGB666 */
     }
+    if ((s.hdr.flags & 0x2) == 0) {
+        return false;                            /* v4 streams whole frames */
+    }
     s.src = blob + sizeof(video_hdr_t);
     s.src_len = blob_len - sizeof(video_hdr_t);
     lz_reset();

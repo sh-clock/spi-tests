@@ -1,0 +1,49 @@
+MSP3520 video player v4 (progressive block streaming) - flashable firmware
+ESP32-S3 (esp32s3) - ESP-IDF v6.1 - 2026-11-15
+THE FPS FIX: v3 sent every display line as 4 separate SPI transactions
+(1280 per frame, ~12 ms/frame of pure dead time - why you measured
+8.5 fps instead of ~10.5). v4 sets the full-screen window once, then
+streams each frame as ONE RAMWR + 20 back-to-back 16-line DMA blocks
+(41 transactions per frame). Expect ~10.5 fps at the 35-60 MHz steps.
+Also: interlacing is gone - no more combing on motion.
+
+FILES
+  bootloader.bin                 flash at 0x0
+  partition-table.bin            flash at 0x8000
+  msp3520_video_oc_test.bin      flash at 0x10000  (7.1 MB - video inside)
+  msp3520_video_oc_test_full.bin all three merged - flash at 0x0 (easiest)
+
+FLASH (adjust COM port):
+  C:\Espressif\tools\python\v6.1\venv\Scripts\python.exe -m esptool --chip esp32s3 -p COM10 -b 460800 --before default-reset --after hard-reset write-flash 0x0 msp3520_video_oc_test_full.bin
+
+WHAT TO EXPECT (S3 clock reality: 35-60 MHz requests run at 40 MHz,
+65-80 MHz requests run at 80 MHz - no other steps exist):
+  - boot: dark blue fill, banner, ID line, sweep from 10 MHz
+  - steps 10-30 MHz: lower fps, clean picture
+  - steps 35-60 MHz (all = 40 MHz actual): ~10.5 fps  <- the v4 gain
+  - steps 65-80 MHz (all = 80 MHz actual): expect snow. This is not your
+    wiring: the ILI9488 datasheet specifies a 50 ns minimum serial write
+    cycle (20 MHz max) - 40 MHz is already 2x over spec (the highest
+    reliably reported clock for this controller anywhere), 80 MHz is 4x.
+    Last $0 experiment if you want to try anyway:
+      1. series resistor 47-100 ohm on SCK at the ESP32 end (dampens
+         reflections on the jumper wires), GND wire routed next to SCK
+      2. rebuild with LCD_EDGE_DRIVE_CAP 1 in main/msp3520.h (weaker
+         SCK/MOSI edges) - knob is in the source, off by default
+      3. retest at 70/75/80 with the firmware's retest loop
+    Expectation is low - the die is the limiter, not the wires.
+
+IF COLORS LOOK WRONG: red/blue swapped -> LCD_MADCTL 0x28 -> 0x20 in
+main/msp3520.h and rebuild. Upside-down -> 0xE8. (0x28 is hardware-
+verified on your panel, so this should not be needed.)
+
+WIRING (unchanged): CS GPIO10, DC GPIO9, RESET GPIO14, MOSI GPIO11,
+SCK GPIO12, backlight GPIO47, VCC 3.3-5V, GND.
+
+THE HONEST CEILING ON THIS PANEL (ILI9488 over SPI):
+  40 MHz bus -> 10.8 fps theoretical, ~10.5 real (this firmware)
+  80 MHz bus -> 20.7 fps theoretical, but the ILI9488 dies at 80
+  24 fps     -> needs 88.5 Mbps; impossible on ILI9488 over SPI
+  16-bit color -> not supported by the ILI9488 on native SPI at all
+  (16-bit SPI only exists on modules with a board-level SPI->parallel
+  converter, e.g. KeDei v4.0, or other controllers like ST7796)

@@ -1,14 +1,14 @@
 /*
- * main.c — MSP3520 interlaced video player + SPI clock sweep.
+ * main.c — MSP3520 progressive video player + SPI clock sweep.
  *
  * Plays the converted video (embedded video.bin, 480x320, 15 fps source)
- * on the display using INTERLACING: each 15 fps frame is sent as two
- * fields — even display rows first, then odd rows. A field is 160 lines
- * (230,400 bytes with RGB666) instead of a full frame's 320 lines, halving the bytes
- * per screen update; two consecutive fields make one complete picture.
- * Consequence worth knowing: on fast motion you may see a faint "combing"
- * on horizontal edges for one field time — that is inherent to interlacing
- * and NOT a fault. Corruption (noise, torn stripes, wrong colors) IS.
+ * as full progressive frames: the whole-display address window is set once
+ * (msp3520_prepare_stream), then each frame is ONE RAMWR followed by pure
+ * pixel data in 16-line DMA blocks — 41 SPI transactions per frame instead
+ * of the 1280 the v3 per-line protocol needed (that transaction overhead
+ * was worth ~12 ms/field — the reason v3 measured 8.5 fps at 40 MHz).
+ * No interlacing, no combing. Corruption (noise, stripes, wrong colors)
+ * IS a fault: press n.
  *
  * The sweep runs the SAME video at 10..80 MHz SPI clock, 5 MHz steps. At
  * each frequency the video loops for PLAY_SECONDS while you watch; press
@@ -16,12 +16,12 @@
  *    y = clean   n = artifacts   r = restart this frequency   q = stop
  * After the time runs out you get the same question once more.
  *
- * Frame rates to expect: with RGB666 a field is 1,843,200 bits, so the
- * ideal field time is bits/clock. 15 fps needs 30 fields/s = 33.3 ms/field
- * = ~62 MHz — the 40 MHz bus manages ~10 fps. NOTE the ESP32-S3 cannot
- * generate every clock: requests of 35-60 MHz actually run at 40 MHz,
- * 65-80 MHz at 80 MHz. The console shows the measured fps at every
- * frequency — a nice second opinion on the bus limit.
+ * Frame rates to expect: with RGB666 a frame is 3,686,400 bits, so the
+ * ideal frame time is bits/clock; 15 fps needs ~62 MHz — the 40 MHz bus
+ * manages ~10.7 fps. NOTE the ESP32-S3 cannot generate every clock:
+ * requests of 35-60 MHz actually run at 40 MHz, 65-80 MHz at 80 MHz (the
+ * ILI9488 is 4x out of spec at 80 — expect snow there). The console shows
+ * the measured fps at every frequency — a second opinion on the bus limit.
  */
 #include <stdio.h>
 #include <string.h>
@@ -40,7 +40,7 @@ extern const uint8_t video_start[] asm("_binary_video_bin_start");
 extern const uint8_t video_end[]   asm("_binary_video_bin_end");
 
 /* Line buffers are sized for the largest supported wire format; the bytes
- * actually sent per line are 480 * video_hdr()->bpp (see msp3520_queue_line). */
+ * actually sent per line are 480 * video_hdr()->bpp (see msp3520_queue_block). */
 
 /* ================= configuration ================= */
 
@@ -53,10 +53,10 @@ extern const uint8_t video_end[]   asm("_binary_video_bin_end");
 
 #define PLAY_SECONDS     10          /* video loop time per frequency */
 
-#define FIELD_LINES      (LCD_V_RES / 2)          /* 160 */
+#define FRAME_BLOCKS     (LCD_V_RES / LCD_BLOCK_LINES)   /* 20 */
 
-/* double line buffers: one in flight on SPI, one being decoded */
-static uint8_t s_line[TX_LINES_IN_FLIGHT][LCD_LINE_BYTES];
+/* double block buffers: one in flight on SPI, one being decoded */
+static uint8_t s_block[TX_BLOCKS_IN_FLIGHT][LCD_BLOCK_BYTES];
 
 /* ================= console helpers (same style as project 1) =========== */
 
@@ -152,26 +152,37 @@ typedef struct {
 
 static step_t s_steps[STEP_COUNT];
 
-/* Push one interlaced field (rows parity, parity+2, ... , 319-parity).
+/* Push one full progressive frame (320 lines = 20 blocks of 16 lines).
  * Returns false only if the video decoder hard-fails (corrupt blob). */
-static bool push_field(int parity)
+static bool push_frame(void)
 {
-    msp3520_field_begin();                  /* CS low for the whole field */
-    for (int i = 0; i < FIELD_LINES; i++) {
-        if (!video_read_line(s_line[i & 1])) {
-            /* end of the video inside a field cannot happen (the blob ends
-             * on field boundaries), but be safe and restart the decoder */
-            video_rewind();
-            if (!video_read_line(s_line[i & 1])) {
-                return false;
+    const video_hdr_t *hdr = video_hdr();
+    const size_t stride = (size_t)LCD_H_RES * hdr->bpp;  /* wire bytes/line */
+
+    ESP_ERROR_CHECK(msp3520_field_begin());  /* CS low + RAMWR: from row 0 */
+    int live = 0;
+    for (int b = 0; b < FRAME_BLOCKS; b++) {
+        uint8_t *dst = s_block[b & (TX_BLOCKS_IN_FLIGHT - 1)];
+        for (int l = 0; l < LCD_BLOCK_LINES; l++) {
+            if (!video_read_line(dst + l * stride)) {
+                /* end of the video inside a frame cannot happen (the blob
+                 * ends on frame boundaries), but be safe and restart */
+                video_rewind();
+                if (!video_read_line(dst + l * stride)) {
+                    return false;
+                }
             }
         }
-        ESP_ERROR_CHECK(msp3520_queue_line(parity + 2 * i, s_line[i & 1]));
-        if (i >= TX_LINES_IN_FLIGHT - 1) {
-            ESP_ERROR_CHECK(msp3520_retire_line());
+        ESP_ERROR_CHECK(msp3520_queue_block(dst));
+        if (++live >= TX_BLOCKS_IN_FLIGHT) {
+            ESP_ERROR_CHECK(msp3520_retire_block());
+            live--;
         }
     }
-    ESP_ERROR_CHECK(msp3520_retire_line());
+    while (live > 0) {
+        ESP_ERROR_CHECK(msp3520_retire_block());
+        live--;
+    }
     msp3520_field_end();
     return true;
 }
@@ -200,17 +211,16 @@ static void pace_until(int64_t target_us)
 }
 
 /* Play the looping video for `seconds` at the current SPI clock.
- * Fields are paced to 30 per second (= 15 fps natural speed) whenever the
- * bus finishes early; when the bus is slower than that, playback simply
- * runs at whatever the bus allows (measured fps drops below 15).
+ * Frames are paced to 15 per second whenever the bus finishes early; when
+ * the bus is slower than that, playback simply runs at whatever the bus
+ * allows (measured fps drops below 15).
  * Returns a verdict key ('y','n','r','q') pressed during playback, or 0 if
  * the time simply ran out. Fills *fps_x10 and *frames. */
 static char play_segment(int seconds, uint32_t *frames_out, uint32_t *fps_x10)
 {
     const video_hdr_t *hdr = video_hdr();
     uint32_t frames = 0;
-    uint32_t fields = 0;
-    uint32_t field = 0;                 /* interlace field index 0..fields */
+    uint32_t frame = 0;                 /* frame index 0..hdr->fields */
     int64_t t0 = esp_timer_get_time();
     int64_t deadline = t0 + (int64_t)seconds * 1000000;
     int64_t next_status = t0 + 500000;
@@ -221,21 +231,18 @@ static char play_segment(int seconds, uint32_t *frames_out, uint32_t *fps_x10)
             break;
         }
 
-        if (!push_field((int)(field & 1))) {
+        if (!push_frame()) {
             break;
         }
-        fields++;
-        if ((fields & 1) == 0) {
-            frames++;                   /* two fields = one full frame */
-        }
-        field++;
-        if (field >= hdr->fields) {
-            field = 0;                  /* loop the video */
+        frames++;
+        frame++;
+        if (frame >= hdr->fields) {
+            frame = 0;                  /* loop the video */
             video_rewind();
         }
 
-        /* natural speed: 30 fields/s when the bus keeps up */
-        pace_until(t0 + (int64_t)(fields + 1) * (1000000 / 30));
+        /* natural speed: 15 fps when the bus keeps up */
+        pace_until(t0 + (int64_t)(frames + 1) * (1000000 / 15));
 
         /* live keys: judge while watching, no need to wait for the end */
         char k = poll_key();
@@ -464,10 +471,10 @@ static void print_banner(const video_hdr_t *hdr)
            (unsigned)hdr->bpp, (unsigned)(hdr->bpp == 3 ? 0x66 : 0x55));
     printf("  reality: 35-60 MHz requests run at 40 MHz, 65-80 MHz at\n");
     printf("  80 MHz (no other steps exist).\n");
-    printf("  INTERLACING: each frame goes out as 2 fields (even rows,\n");
-    printf("  then odd rows) = half the bytes per screen update. Faint\n");
-    printf("  combing on fast motion is NORMAL. Noise, torn stripes,\n");
-    printf("  wrong colors or freezes are NOT - press n.\n");
+    printf("  PROGRESSIVE scan, 16-line DMA blocks: ~41 SPI transactions\n");
+    printf("  per frame (v3 needed 1280 - that overhead cost it ~2 fps).\n");
+    printf("  No combing. Noise, torn stripes, wrong colors or freezes\n");
+    printf("  are NOT normal - press n.\n");
     printf("\n");
     printf("  Keys work DURING playback (single keypress, no Enter):\n");
     printf("    y  PASS   n  FAIL   r  restart   q  quit sweep\n");

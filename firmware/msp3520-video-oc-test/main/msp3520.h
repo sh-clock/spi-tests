@@ -1,6 +1,6 @@
 /*
  * msp3520.h — ESP-IDF driver for the MSP3520 3.5" SPI display (480x320,
- * ILI9488) tuned for streaming an interlaced video.
+ * ILI9488) tuned for streaming progressive video.
  *
  * Same wiring as the msp3520-oc-test project (ESP32-S3-DevKitC-1):
  *   MSP3520 pin          ESP32-S3 GPIO
@@ -20,14 +20,14 @@
  *    (interrupt-driven) transactions possible: the callback runs right
  *    before each transaction hits the wire, so D/C is always correct even
  *    with several transactions in flight.
- *  - new streaming API for interlaced fields:
- *      msp3520_prepare_stream()   once per panel init (sets column window)
- *      msp3520_field_begin()      CS low
- *      msp3520_queue_line(y, px)  queue PASET+RAMWR+960 B for one line
- *      msp3520_retire_line()      wait until the oldest queued line is done
- *      msp3520_field_end()        CS high
- *    Keeping two lines "in flight" lets the CPU decode the next line while
- *    DMA is still pushing the previous one.
+ *  - new streaming API for full-frame progressive video:
+ *      msp3520_prepare_stream()    once per panel init (CASET+PASET window)
+ *      msp3520_field_begin()       CS low + RAMWR (write starts at row 0)
+ *      msp3520_queue_block(px)     queue 16 lines of pixel data (one DMA tx)
+ *      msp3520_retire_block()      wait until the oldest queued block is done
+ *      msp3520_field_end()         CS high
+ *    Keeping two blocks "in flight" lets the CPU decode the next block
+ *    while DMA is still pushing the previous one.
  */
 #pragma once
 
@@ -51,10 +51,19 @@
 #define LCD_BPP         3                          /* default wire fmt (666) */
 #define LCD_LINE_BYTES  (LCD_H_RES * LCD_BPP)      /* 1440 (RGB666 line)     */
 #define LCD_LINE_BYTES_MAX (LCD_H_RES * 3)         /* 1440 (RGB666 line)     */
-#define LCD_MAX_TRANSFER  (LCD_LINE_BYTES_MAX + 64)
+#define LCD_BLOCK_LINES 16                         /* lines per streamed block */
+#define LCD_BLOCK_BYTES (LCD_LINE_BYTES_MAX * LCD_BLOCK_LINES)  /* 23040 */
+#define LCD_MAX_TRANSFER  (LCD_BLOCK_BYTES + 64)
 
 /* Set to 1 if your panel shows inverted-looking colors (see README). */
 #define LCD_INVERT_COLORS 0
+
+/* EXPERIMENT for 80 MHz stability on long jumper wires: SCK/MOSI GPIO drive
+ * capability. -1 = ESP-IDF default (20 mA class); 0..3 = weakest..strongest
+ * (gpio_drive_cap_t). Weaker edges (0/1) reduce ringing — but the ILI9488 is
+ * 4x out of spec at 80 MHz (datasheet min serial write cycle 50 ns = 20 MHz
+ * max), so this is a last-resort experiment, not a fix. */
+#define LCD_EDGE_DRIVE_CAP (-1)
 
 /* MADCTL (memory access control). 0x28 = landscape 480x320, origin top-left
  * (MV row/column exchange + BGR). If the picture comes out upside-down on
@@ -76,8 +85,8 @@ uint32_t  msp3520_get_clock(void);
  * its native 4-wire SPI interface — 16-bit RGB565 is for the parallel
  * interface (verified: TFT_eSPI, LovyanGFX and Arduino_GFX all force
  * 18-bit for ILI9488 SPI; LCDWiki's own MSP3520 demo uses 0x66; setting
- * 0x55 on native SPI yields a blank screen). Line buffers passed to
- * msp3520_queue_line() must hold 480*bpp bytes. */
+ * 0x55 on native SPI yields a blank screen). Block buffers passed to
+ * msp3520_queue_block() must hold LCD_BLOCK_BYTES bytes. */
 esp_err_t msp3520_set_wire_bpp(int bpp);
 int       msp3520_get_wire_bpp(void);
 
@@ -93,27 +102,33 @@ void msp3520_backlight(bool on);
 /* Fill the whole screen with one color (boot / blank screen). */
 esp_err_t msp3520_fill_screen(uint16_t color565);
 
-/* --- interlaced field streaming ----------------------------------------- */
+/* --- full-frame block streaming ----------------------------------------- */
 
-/* Set the column window once (CASET 0..479). After a panel reset this must
- * be called once before the first field; the controller keeps the window
- * for every subsequent line write. */
+/* Set the address window to the whole display (CASET 0..479 + PASET 0..319).
+ * After a panel reset this must be called once; afterwards every frame is
+ * streamed as pure pixel data — the controller wraps rows inside the window,
+ * so no per-line PASET/RAMWR addressing is needed on the wire. */
 esp_err_t msp3520_prepare_stream(void);
 
-void msp3520_field_begin(void);
+/* CS low + RAMWR: opens a frame write; the address pointer resets to the
+ * window start (row 0) and keeps advancing while CS stays low. */
+esp_err_t msp3520_field_begin(void);
 
-/* Queue one display line (480 * wire_bpp bytes) at row `y`. Up to
- * TX_LINES_IN_FLIGHT lines may be queued before a retire is needed. */
-esp_err_t msp3520_queue_line(uint16_t y, const uint8_t *line_bytes);
+/* Queue one block of LCD_BLOCK_LINES consecutive display lines
+ * (LCD_BLOCK_LINES * 480 * wire_bpp bytes) as a single DMA transaction.
+ * Up to TX_BLOCKS_IN_FLIGHT blocks may be queued before a retire is
+ * needed; the caller's buffer must stay untouched until the matching
+ * retire. */
+esp_err_t msp3520_queue_block(const uint8_t *block_bytes);
 
-/* Wait until the oldest queued line has fully left the wire, so its buffer
- * can be reused. (Queue and retire strictly in FIFO order.) */
-esp_err_t msp3520_retire_line(void);
+/* Wait until the oldest queued block has fully left the wire, so its
+ * buffer can be reused. (Queue and retire strictly in FIFO order.) */
+esp_err_t msp3520_retire_block(void);
 
 void msp3520_field_end(void);
 
-/* How many lines the player may queue before retiring (double buffering). */
-#define TX_LINES_IN_FLIGHT 2
+/* How many blocks the player may queue before retiring (double buffering). */
+#define TX_BLOCKS_IN_FLIGHT 2
 
 /* Convert one RGB565 color to the 2-byte big-endian wire format
  * (hi = R4..R0 G5..G3, lo = G2..G0 B4..B0 — ILI9488 16bpp, MSB first). */

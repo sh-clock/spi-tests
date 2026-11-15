@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Visual audit of the v3 firmware's wire data: render frame 0 from the
+"""Visual audit of the firmware's wire data: render frames from the
 gcc-compiled device decoder's output (the exact bytes that go on the SPI
-wire), and pixel-compare against the source video frame run through the
+wire), and pixel-compare against the source video frames run through the
 same conversion pipeline (median filter). RGB666 quantization ((v>>3)<<3)
-loses at most 7 per channel, so max channel error must be <= 7."""
+loses at most 7 per channel, so max channel error must be <= 7.
+Handles both blob scans: progressive (frames in order) and interlaced
+(even/odd field pairs)."""
 
 import sys
 
@@ -14,18 +16,43 @@ from convert_video import decode_frames, W, H  # noqa: E402
 
 CDEC = "/tmp/c_decoded_lines.bin"
 SRC = "/home/z/my-project/upload/Hill[729].mp4"
+BLOB = "/home/z/my-project/download/msp3520-video-oc-test/main/video.bin"
+
+hdr = open(BLOB, "rb").read(24)
+n_frames = hdr[8] | (hdr[9] << 8)
+flags = hdr[10] | (hdr[11] << 8)
+n_units = int.from_bytes(hdr[16:20], "little")
+progressive = bool(flags & 2)
+print(f"blob: {n_frames} frames, {n_units} units, "
+      f"{'progressive' if progressive else 'interlaced'}")
 
 data = open(CDEC, "rb").read()
 BPL = W * 3
-expected = 238 * 160 * BPL
+unit_lines = H if progressive else H // 2
+expected = n_units * unit_lines * BPL
 assert len(data) == expected, f"decoder output {len(data)} != {expected}"
 
-f0 = np.frombuffer(data[0:160 * BPL], dtype=np.uint8).reshape(160, W, 3)
-f1 = np.frombuffer(data[160 * BPL:320 * BPL], dtype=np.uint8).reshape(160, W, 3)
-frame = np.empty((H, W, 3), dtype=np.uint8)
-frame[0::2] = f0            # field 0 = even display rows
-frame[1::2] = f1            # field 1 = odd display rows
-Image.fromarray(frame).save("/tmp/v3_frame0.png")
+
+def frame_bytes(fi):
+    """reconstruct display frame fi from the decoded line stream"""
+    fr = np.empty((H, W, 3), dtype=np.uint8)
+    if progressive:
+        base = fi * H * BPL
+        fr[:] = np.frombuffer(data[base:base + H * BPL],
+                              dtype=np.uint8).reshape(H, W, 3)
+    else:
+        base = (2 * fi) * (H // 2) * BPL
+        ev = np.frombuffer(data[base:base + (H // 2) * BPL],
+                           dtype=np.uint8).reshape(H // 2, W, 3)
+        od = np.frombuffer(data[base + (H // 2) * BPL:base + H * BPL],
+                           dtype=np.uint8).reshape(H // 2, W, 3)
+        fr[0::2] = ev
+        fr[1::2] = od
+    return fr
+
+
+frame = frame_bytes(0)
+Image.fromarray(frame).save("/tmp/v4_frame0.png")
 
 frames = decode_frames(SRC, "320:208:0:16", 15)
 ref = frames[0]
@@ -34,19 +61,13 @@ print(f"decoder frame 0 vs source (same pipeline): "
       f"max channel error {err.max()}, mean {err.mean():.3f}")
 assert err.max() <= 7, "PIXEL AUDIT FAILED: error above quantization bound"
 
-# every 20th frame too, to prove the whole stream (not just frame 0)
-for fi in range(20, 119, 20):
-    fr = np.empty((H, W, 3), dtype=np.uint8)
-    base = (2 * fi) * 160 * BPL
-    ev = np.frombuffer(data[base:base + 160 * BPL], dtype=np.uint8).reshape(160, W, 3)
-    od = np.frombuffer(data[base + 160 * BPL:base + 320 * BPL], dtype=np.uint8).reshape(160, W, 3)
-    fr[0::2] = ev
-    fr[1::2] = od
+for fi in range(20, n_frames, 20):
+    fr = frame_bytes(fi)
     e = np.abs(fr.astype(np.int16) - frames[fi].astype(np.int16)).max()
     print(f"  frame {fi}: max channel error {e}")
     assert e <= 7, f"PIXEL AUDIT FAILED at frame {fi}"
 
 ss = np.concatenate([ref, frame], axis=1)
-Image.fromarray(ss).save("/tmp/v3_sidebyside.png")
+Image.fromarray(ss).save("/tmp/v4_sidebyside.png")
 print("PIXEL AUDIT: PASS — all checked frames within the RGB666 "
       "quantization bound (max err <= 7/255 per channel)")

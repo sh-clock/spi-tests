@@ -47,7 +47,7 @@ typedef struct __attribute__((packed)) {
     uint16_t width;         /* 480                                      */
     uint16_t height;        /* 320                                      */
     uint16_t frames;        /* number of source frames                  */
-    uint16_t flags;         /* bit0: 0 = even lines in field 0          */
+    uint16_t flags;         /* bit1: 1 = progressive (v4 player needs it) */
     uint32_t rle_len;       /* decoded RLE stream size in bytes         */
     uint32_t fields;        /* frames * 2                               */
     uint32_t bpp;           /* wire bytes/px: 3 = RGB666 (SPI), 2 = RGB565  */

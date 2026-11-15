@@ -33,7 +33,8 @@ int main(int argc, char **argv)
     FILE *o = fopen(argv[2], "wb");
     if (!o) { perror("open out"); return 2; }
     static uint8_t line[VIDEO_LINE_BYTES];
-    uint32_t total_lines = h->fields * (h->height / 2);
+    uint32_t unit_lines = (h->flags & 0x2) ? h->height : h->height / 2;
+    uint32_t total_lines = h->fields * unit_lines;
     uint32_t ok_lines = 0;
     for (uint32_t i = 0; i < total_lines; i++) {
         if (!video_read_line(line)) {
