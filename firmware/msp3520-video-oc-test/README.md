@@ -1,11 +1,15 @@
-# MSP3520 Video Player + SPI Clock Sweep — ESP32-S3 + ESP-IDF (v5)
+# MSP3520 Video Player + SPI Clock Sweep — ESP32-S3 + ESP-IDF (v6)
 
 The second MSP3520 test program: it plays **your video** (`Hill[729].mp4`,
-converted and embedded — 119 frames, 15 fps, 7.9 s) fullscreen on the
-480×320 display at every SPI clock from **10 MHz to 80 MHz** in 5 MHz
-steps, and records your pass/fail verdict per frequency. Default playback
-is **progressive** (one full-frame update per frame); a live **`i` key
-toggles column-interlaced mode** — a cadence experiment, see §1.
+converted and embedded — 119 source frames, 15 fps, 7.9 s → 173 fields)
+fullscreen on the 480×320 display at every SPI clock from **10 MHz to
+80 MHz** in 5 MHz steps, and records your pass/fail verdict per frequency.
+v6 plays **field-interlaced**: every field is one 240-px half of the screen
+carrying a **fresh source sample**, so motion advances at **~21.7 steps/s
+at 40 MHz** — double the ~10.85 full-frame rate of the progressive v4/v5
+builds. The trade (the classic interlace one, accepted): each field is
+half the picture, so there is a stationary mid-screen seam and fast pans
+shear across it; see §1.
 
 ```
 msp3520-video-oc-test/
@@ -34,57 +38,58 @@ step-by-step install guide if you haven't set up ESP-IDF yet). Quick table:
 | 5 DC/RS | GPIO9 | 10–14 (touch) | not connected |
 
 **One hardware requirement specific to this project:** the video lives
-inside the firmware image, so the app is ~7.5 MB. The standard
+inside the firmware image, so the app is ~5.6 MB. The standard
 ESP32-S3-DevKitC-1 has 8 MB of flash (N8/N8R2 and N16 modules all work).
-**The `i` (interlace) mode additionally needs PSRAM** for its frame stage
-(N8R2/N8R8 class modules). PSRAM is **off in the default build** (so the
-sweep runs on every board); to use `i`, enable it once via
-`idf.py menuconfig` → Component config → ESP PSRAM (quad mode for N8R2,
-octal for N8R8), then rebuild. Without it, `i` prints
-`interlace unavailable` and playback stays progressive.
+That is the only requirement — v6 needs **no PSRAM** (fields stream
+straight from the decoder to the wire; no full frame is ever staged).
 
 ---
 
-## 1. Progressive vs the `i` experiment — the honest physics
+## 1. Field-interlaced playback — the honest physics
 
-A full frame is 480×320×3 bytes = 460,800 bytes over the wire. At 15 fps
-that is 55.3 Mbit/s; the 40 MHz bus (the panel's practical ceiling — see
-the sweep) carries 3.6864 Mbit per frame → **~10.8 fps is the hard
-ceiling** for fullscreen RGB666, whatever the firmware does.
+A full RGB666 frame is 480×320×3 = 460,800 bytes over the wire. The 40 MHz
+bus (the panel's practical ceiling — see the sweep) therefore tops out at
+**~10.85 full frames/s**, whatever the firmware does. A half-frame is
+230,400 bytes, so the same bus carries **~21.7 fields/s**.
 
-**Default (progressive):** each frame is ONE full-screen update — the
-address window is re-asserted, then one RAMWR + 20 pure-data DMA blocks of
-16 lines (25 SPI transactions per frame; v3 needed 1280). ~10.5 fps
-measured at 40 MHz. No interlacing artifacts of any kind.
+**v5 (progressive / same-frame halves):** one full-screen update per
+source frame — ~10.5 fps measured at 40 MHz, no artifacts. v5's `i` key
+split each frame into two half-screen updates, but both halves carried the
+SAME frame: the wire still moved every byte of every picture, so the
+picture rate could not move (interlacing halves the bytes per *field*,
+never the bytes per *picture*). Honest, but not a speedup.
 
-**Press `i` (column-interlace):** each frame goes out as TWO half-screen
-updates — the left 240-px half, then the right half ~46 ms later. Each
-half is a contiguous address window, so it streams at full efficiency:
-**~21 updates/s** at 40 MHz. The status line shows both numbers, e.g.
-`10.3 fps (20.6 upd/s)`.
+**v6 (field-native content):** the blob itself is baked as fields. Field
+*k* is one 240-px half (even *k* = left, odd = right) of the source frame
+at time *k*/21.70 s — every field carries a **fresh temporal sample**, one
+field period after the previous one. The player streams them straight
+into alternating half-windows (16-line DMA blocks, ~23 SPI transactions
+per field, no PSRAM — no full frame ever exists in RAM). Result at
+40 MHz: **~21.7 fields/s, motion advancing at double cadence** vs the
+progressive build. Static content is pixel-identical to progressive.
 
-What this can and cannot do (research-verified — four independent
-literature sweeps, summarised in the repo WORKLOG §14):
+The trade (the classic interlace one — accepted for this build):
 
-* **CAN:** double the *update cadence* (21 regular ~46 ms updates/s
-  instead of ~10.5 irregular full-frame steps). Whether that *looks*
-  smoother is content-dependent and a matter of taste — this build exists
-  so you can A/B it with your own eyes.
-* **CANNOT:** raise the frame rate. Interlacing halves the bytes per
-  *field*, never the bytes per *picture* — no broadcast system ever
-  gained unique pictures/s from it (480i60 = 30 pictures/s, 576i50 = 25).
-  Its temporal gain only ever applied to field-native sources (50i/60i
-  cameras); this video is 15 fps *progressive*, so there is no extra
-  motion information to send. Every pixel still updates at ~10.85 Hz.
-* **Cost:** a stationary vertical seam at mid-screen; during fast
-  horizontal pans the two sides can be ~46 ms of motion apart (shear at
-  the seam). Static scenes: identical to progressive.
+* Each field covers half the screen; the other half is one field period
+  (46 ms) older. There is a **stationary vertical seam at mid-screen**,
+  and during fast horizontal pans the two sides shear by ~46 ms of motion
+  across that seam.
+* Per-pixel update rate is unchanged (~10.85 Hz at 40 MHz) — what doubles
+  is the *global* motion cadence: something on screen advances every
+  46 ms instead of every 92 ms.
+* The 15 fps source only has 15 unique samples/s: 173 fields sample the
+  119 frames, so v6 displays ~15 unique temporal samples/s vs
+  progressive's ~10.85 (+38%) at a 2× display cadence — not a full 2× of
+  *new* information (that would need a ≥21.7 fps source; convert any such
+  clip with the same command and v6 plays it at the full 21.7).
 
-If the interlaced mode looks worse to you, leave it off — nothing else
-changed. (Historical note: v1–v3 of this project used ROW interlacing —
-even/odd rows — which combed on every moving edge and needed 4 SPI
-transactions per line. v4 removed it; v5's column version is a different,
-cheaper variant: contiguous windows, one seam instead of combing.)
+(Historical note: v1–v3 used ROW interlacing — even/odd rows — which
+combed on every moving edge and needed 4 SPI transactions per line; v4
+went progressive; v5 tried same-frame column halves as a cadence A/B; v6
+bakes the column split into the content itself. True even/odd *row* fields
+would still need one address window per line — 1280 transactions/frame —
+which is why the wire-cheap realization of interlacing on the ILI9488 is
+the half-*window* split.)
 
 ## 2. How the video got into the firmware
 
@@ -104,38 +109,40 @@ assert — every decoded line must equal the source pixels exactly):
    the ILI9488 takes over SPI. Dropping the green LSB (effective RGB555)
    roughly doubled compression; on an 18-bit panel showing this content it
    is not visible.
-4. **Progressive scan layout** (`--scan progressive`, the default since
-   v4): plain frame-after-frame line order. (The legacy `--scan interlaced`
-   even/odd-field layout of v1–v3 still exists for compatibility.)
+4. **Field-halves scan layout** (`--scan field-halves`, the shipped
+   blob's mode since v6): each field is one 240-px half of the source
+   frame at its own timestamp, alternating left/right at the field rate
+   (`--field-rate`, default 21.70 = the 40 MHz wire ceiling; keep it in
+   sync with `FIELD_HZ_X100` in `main.c`). (`--scan progressive`
+   whole-frame layout — what v4/v5 shipped — and the legacy
+   `--scan interlaced` even/odd-line layout of v1–v3 also remain.)
 5. **Per-line RLE.** Runs of `[count-1][R][G][B]`, counts summing to 480
    per display line.
 6. **LZSS.** A small home-grown LZ (64 KiB window, 3-byte match tokens)
    squeezes repetition across lines. No zlib/deflate on the device needed —
    the decoder is ~150 lines of C you can read.
 
-Result: 54,835,200 bytes of raw pixels → **7,254,058 bytes (7.6×)**,
+Result: 39,859,200 bytes of raw pixels → **5,304,991 bytes (7.5×)**,
 embedded into the firmware and flashed with `idf.py flash` — no extra
 upload step. The decoder was verified on the build machine: the exact
-`video.c` that runs on the ESP32-S3 decodes all 38,080 display lines
+`video.c` that runs on the ESP32-S3 decodes all 55,360 field lines
 byte-identical to the reference expansion (`tools/host_test_video.py`).
 
 To embed a different video (any resolution/aspect/fps up to a few tens of
 seconds):
 
 ```
-python3 tools/convert_video.py YOURCLIP.mp4 main/video.bin --drop-green-lsb
+python3 tools/convert_video.py YOURCLIP.mp4 main/video.bin --scan field-halves
 ```
 
 `convert_video.py --help` documents every knob (crop, fps re-timing,
-filters). Keep the output under ~7 MB (the script prints the size and
-verifies the roundtrip every time). Then rebuild and re-flash.
+filters, field rate). Keep the output under ~7 MB (the script prints the
+size and verifies the roundtrip every time). Then rebuild and re-flash.
 Requirements: Python 3 with `numpy` and `Pillow`, plus a working `ffmpeg`.
 
-> **Repo status note:** the converter copy in this repo is still the
-> v1–v3 version (magic `MIV1`, even/odd field layout) — it produces
-> blobs this player **rejects** by design. The shipped `video.bin` is
-> already the progressive `MIV2` format. Porting the progressive
-> converter into the repo is pending; ask, and it will be finished.
+> The converter in `tools/` is the current one (MIV2, all three scan
+> layouts). The shipped `video.bin` is `--scan field-halves` (flags=4);
+> a progressive or legacy blob is rejected at boot with a clear message.
 
 ---
 
@@ -153,19 +160,20 @@ The console session looks like this:
 
 ```
   ============================================================
-   MSP3520 VIDEO player + SPI clock sweep (v5)
+   MSP3520 VIDEO player + SPI clock sweep (v6, FIELD-INTERLACED)
    ESP32-S3 + ESP-IDF  |  sweep 10..80 MHz in 5 MHz steps
   ============================================================
 
-  Embedded video: 119 frames @ 15 fps (7.9 s), 119 fields,
-  stored in 7084 KiB (7.6x smaller than the raw 53549 KiB of pixel data)
+  Embedded video: 119 source frames @ 15 fps -> 173 fields
+  (one field = one 240-px half of a FRESH source frame),
+  stored in 5181 KiB (7.5x smaller than the raw 38925 KiB of pixel data)
 
   Wire format: 3 bytes/pixel (COLMOD 0x66). S3 clock
   reality: 35-60 MHz requests run at 40 MHz, 65-80 MHz at
   80 MHz (no other steps exist).
   ...
   [ 1/15] 10 MHz
-  playing: 24 frames, 2.7 fps   [y/n/r/q/d/i]      ← updates every 0.5 s
+  playing: 54 fields, 5.4 fields/s   [y/n/r/q/d]      ← updates every 0.5 s
    -> clean? [y]es [n]o [r]eplay [q]uit:
 ```
 
@@ -178,7 +186,6 @@ The console session looks like this:
 | `r` | restart the video at this frequency |
 | `q` | quit the sweep |
 | `d` | cycle SCK/MOSI GPIO drive capability 0→1→2→3 (80 MHz experiment) |
-| `i` | toggle column-interlace on/off (§1; takes effect next frame) |
 
 Each frequency plays the video on loop for 10 s; if you don't press
 anything you get the same question at the end. The measured fps is printed
@@ -186,25 +193,23 @@ live and goes into the summary:
 
 ```
   ======================== SUMMARY ========================
-   MHz      fps     verdict
+   MHz  fields/s  verdict
   --------------------------------------------------------
-   10     2.7    PASS
-   40    10.5    PASS
-   60    10.5    PASS      ← 35-60 all run at 40 MHz actual
-   80     8.2    FAIL      ← snow; 80 is 4x the panel's spec
+   10     5.4    PASS
+   40    20.6    PASS
+   60    20.6    PASS      ← 35-60 all run at 40 MHz actual
+   80    16.4    FAIL      ← snow; 80 is 4x the panel's spec
   ========================================================
   Highest CLEAN frequency : 40 MHz  (…)
   Suggested for projects  : 35 MHz or lower
 ```
 
-Reading the fps column:
+Reading the fields/s column:
 
-* **~10.5** = bus-limited at 40 MHz actual — that IS the RGB666 wire
-  ceiling (2.7 fps at 10 MHz, 5.4 at 20, 8.1 at 30). A sudden *drop*
-  compared to the previous step is itself a sign of corruption — dropped
-  bytes cost both picture quality and throughput.
-* With `i` on, the same ceiling applies — the counter then also shows the
-  update rate (`10.3 fps (20.6 upd/s)`).
+* **~20.6** = bus-limited at 40 MHz actual — that IS the RGB666 wire
+  ceiling for half-frames (5.4 fields/s at 10 MHz, 10.9 at 20, 16.3 at
+  30). A sudden *drop* compared to the previous step is itself a sign of
+  corruption — dropped bytes cost both picture quality and throughput.
 
 After the sweep you can re-test any frequency (type `63` + Enter, or just
 Enter to skip), and finally there is a **continuous playback mode**: type a
@@ -217,10 +222,11 @@ your work" mode.
   stripes** (a line's pixels shifted sideways), **color speckles**, a
   **frozen picture** while the fps counter stalls, large **garbage
   blocks**.
-* Normal, *not* failures: slower playback at low clocks; a one-frame
-  "tear" exactly when the video loops back to frame 0 (the loop restarts
-  mid-scroll, every 7.9 s); in `i` mode only — the mid-screen seam and
-  the ~46 ms shear across it during fast pans (§1).
+* Normal, *not* failures: slower playback at low clocks; a one-field
+  "tear" exactly when the video loops back to field 0 (the loop restarts
+  mid-scroll, every ~8.0 s); the stationary mid-screen seam and the
+  ~46 ms shear across it during fast pans (§1) — that is the accepted
+  interlace trade, visible whenever content moves.
 
 Moving video is a much harsher test than static bars: minutes of
 continuous streaming with every byte checked by your eyes. A display that
@@ -233,11 +239,11 @@ passes here will pass anything you throw at it later.
 | Build error: `binary too large` / partition overflow | The 8 MB flash settings didn't apply: delete the generated `sdkconfig` (keep `sdkconfig.defaults`!) and build again; make sure `partitions.csv` is in the project root. |
 | Flashes, then boot loops / `invalid header` | Flash size mismatch: `idf.py erase-flash`, then rebuild+reflash with `CONFIG_ESPTOOLPY_FLASHSIZE_8MB` (set in `sdkconfig.defaults`). |
 | `FATAL: embedded video.bin failed to open` | `main/video.bin` missing or not a converter output — regenerate with `tools/convert_video.py`. |
+| `FATAL: v6 streams FIELD-INTERLACED blobs (flags bit2)` | `video.bin` is a progressive/legacy blob — regenerate with `--scan field-halves`. |
 | Boot screen (dark blue) never appears | Wiring: see the first project's troubleshooting table (LED/backlight, DC/RESET, SCK/MOSI). |
 | Video plays but rows look shuffled / halves swapped | That would be a driver bug, not overclocking — re-check the wiring first (SCK and MOSI are adjacent on both headers and easy to swap). |
 | fps stuck far below the table values at high MHz | Signal quality: shorter wires, reseat jumpers; at the 65–80 steps also try the `d` key + a 47–100 Ω series resistor on SCK. |
-| `[interlace unavailable: no memory for the frame stage]` | Either the module has no PSRAM (N8), or PSRAM is not enabled in the build — the default build ships with it OFF so the sweep works on every board. Menuconfig → Component config → ESP PSRAM, then rebuild (§1). |
-| Seam/shear visible in `i` mode | Expected during fast motion (§1); press `i` again to return to progressive. |
+| Seam/shear visible during motion | Expected (§1) — the accepted interlace trade. Static content is pixel-identical to progressive. |
 | Video loops with a visible jump | Normal: the clip is 7.9 s and loops. |
 
 ## 6. Code walkthrough (what changed vs the first project)
@@ -259,14 +265,16 @@ v5 adds `msp3520_prepare_half_stream()` (a 240-px half-window: CASET
 origin, ILI9488 datasheet §5.2.24) and `msp3520_queue_half_block()`
 (16 half-window lines, 11,520 B).
 
-**`main.c`** — the sweep logic. `push_frame()` streams one progressive
-frame (20 blocks); `push_ilace_frame()` (v5) decodes the frame once into
-a 460,800 B PSRAM stage (the decoder cannot seek back), then streams it
-as two half-frames, slicing each 16-line half-block out of the stage
-with plain `memcpy`s. `play_segment()` loops frames for the test
-duration, paces them to 15 fps when the bus is fast, polls your keys
-non-blocking, and measures fps. The verdict/summary/re-test flow matches
-the first project so both consoles feel the same.
+**`main.c`** — the sweep logic. `push_field(half)` streams one field
+straight from the decoder into a 240-px half-window (20 DMA blocks of 16
+lines, ~23 SPI transactions; no staging, no PSRAM — v5 needed a 460,800 B
+frame stage because its blob held whole frames and the decoder cannot
+seek back; v6's blob holds fields, so the decoder walks exactly what the
+wire needs). `play_segment()` loops fields for the test duration, paces
+them to 21.70/s when the bus is fast (matching the converter's bake
+rate), polls your keys non-blocking, and measures fields/s. The
+verdict/summary/re-test flow matches the first project so both consoles
+feel the same.
 
 ## 7. Going further
 

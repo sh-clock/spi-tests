@@ -35,6 +35,8 @@ typedef struct {
     uint16_t       pend_idx;
     /* header */
     video_hdr_t    hdr;
+    uint16_t       line_px;    /* pixels per RLE line: 480 progressive,
+                                * 240 field-halves (v6) */
 } video_state_t;
 
 static video_state_t s;
@@ -124,9 +126,13 @@ bool video_open(const uint8_t *blob, uint32_t blob_len)
     if (s.hdr.bpp != 2 && s.hdr.bpp != 3) {
         return false;                            /* 2 = RGB565, 3 = RGB666 */
     }
-    if ((s.hdr.flags & 0x2) == 0) {
-        return false;                            /* v4 streams whole frames */
+    const uint16_t scan = s.hdr.flags & 0x6;
+    if (scan != 0x2 && scan != 0x4) {
+        return false;   /* need bit1 (progressive) or bit2 (field-halves);
+                         * bit2 is what the v6 player streams — main.c
+                         * rejects bit1 blobs with its own message */
     }
+    s.line_px = (scan == 0x4) ? 240 : 480;
     s.src = blob + sizeof(video_hdr_t);
     s.src_len = blob_len - sizeof(video_hdr_t);
     lz_reset();
@@ -146,8 +152,9 @@ void video_rewind(void)
 bool video_read_line(uint8_t *dst)
 {
     const int bpp = (s.hdr.bpp == 3) ? 3 : 2;
+    const int width = s.line_px;
     int px = 0;
-    while (px < 480) {
+    while (px < width) {
         uint8_t cb, pxb[3];
         if (!lz_byte(&cb)) {
             return false;                        /* stream exhausted */
@@ -159,8 +166,8 @@ bool video_read_line(uint8_t *dst)
         }
         int cnt = (int)cb + 1;                   /* stored as count-1: 1..256 */
         int take = cnt;
-        if (px + take > 480) {                   /* corrupt data guard */
-            take = 480 - px;
+        if (px + take > width) {                 /* corrupt data guard */
+            take = width - px;
         }
         for (int i = 0; i < take; i++) {
             for (int k = 0; k < bpp; k++) {

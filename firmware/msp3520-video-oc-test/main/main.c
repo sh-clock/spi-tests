@@ -1,18 +1,23 @@
 /*
- * main.c — MSP3520 progressive video player + SPI clock sweep.
+ * main.c — MSP3520 field-interlaced video player + SPI clock sweep (v6).
  *
- * Plays the converted video (embedded video.bin, 480x320, 15 fps source)
- * as full progressive frames: the full-display address window is re-asserted
- * (msp3520_prepare_stream — required after interlace frames), then ONE RAMWR
- * + pure pixel data in 16-line DMA blocks — 25 SPI transactions per frame instead
- * of the 1280 the v3 per-line protocol needed (that transaction overhead
- * was worth ~12 ms/field — the reason v3 measured 8.5 fps at 40 MHz).
- * Default mode is progressive (no combing). 'i' toggles COLUMN-interlaced
- * mode: each frame goes out as two 240-px half-frames ~46 ms apart — the
- * SAME bytes per frame, so the fps ceiling does NOT change (interlacing
- * halves bytes per field, never bytes per picture); it doubles the update
- * rate to ~21.7 fields/s at 40 MHz. Cadence A/B experiment — see README.
- * Corruption (noise, stripes, wrong colors) IS a fault: press n.
+ * Plays the converted video (embedded video.bin, 480x320) as FIELD-NATIVE
+ * half-frames: each field is one 240-px half of the display (left x 0..239,
+ * then right x 240..479) carrying the source frame at its OWN timestamp —
+ * consecutive fields are one field period apart in content. Fields stream
+ * straight from the decoder into 16-line half-window DMA blocks: no PSRAM
+ * stage, no full frame ever exists in RAM.
+ *
+ * Why: a full RGB666 frame is 460,800 B; the 40 MHz bus tops out at ~10.85
+ * full frames/s. A half-frame is 230,400 B, so the same bus carries ~21.7
+ * fields/s — and because every field carries a FRESH source sample, motion
+ * advances at ~21.7 steps/s instead of ~10.85. The trade (accepted): each
+ * field is half the picture, so there is a stationary mid-screen seam and
+ * fast pans shear across it (~1 field period of motion); static content is
+ * pixel-identical to progressive playback. This is the classic interlace
+ * trade realized in the only wire-cheap shape the ILI9488 offers: contiguous
+ * half-windows (true even/odd row interlace would need a CASET+PASET+RAMWR
+ * per line — 1280 transactions/frame, the mistake v1-v3 made).
  *
  * The sweep runs the SAME video at 10..80 MHz SPI clock, 5 MHz steps. At
  * each frequency the video loops for PLAY_SECONDS while you watch; press
@@ -20,12 +25,12 @@
  *    y = clean   n = artifacts   r = restart this frequency   q = stop
  * After the time runs out you get the same question once more.
  *
- * Frame rates to expect: with RGB666 a frame is 3,686,400 bits, so the
- * ideal frame time is bits/clock; 15 fps needs ~62 MHz — the 40 MHz bus
- * manages ~10.7 fps. NOTE the ESP32-S3 cannot generate every clock:
- * requests of 35-60 MHz actually run at 40 MHz, 65-80 MHz at 80 MHz (the
- * ILI9488 is 4x out of spec at 80 — expect snow there). The console shows
- * the measured fps at every frequency — a second opinion on the bus limit.
+ * Field rates to expect: with RGB666 a field is 1,843,200 bits, so the
+ * ideal field time is bits/clock; the 40 MHz bus manages ~21.7 fields/s
+ * (~20.6 measured with transaction overhead). NOTE the ESP32-S3 cannot
+ * generate every clock: requests of 35-60 MHz actually run at 40 MHz,
+ * 65-80 MHz at 80 MHz (the ILI9488 is 4x out of spec at 80 — expect snow
+ * there). The console shows the measured field rate at every frequency.
  */
 #include <stdio.h>
 #include <string.h>
@@ -35,7 +40,6 @@
 #include "freertos/task.h"
 #include "esp_timer.h"
 #include "driver/uart.h"
-#include "esp_heap_caps.h"
 
 #include "msp3520.h"
 #include "video.h"
@@ -63,13 +67,14 @@ extern const uint8_t video_end[]   asm("_binary_video_bin_end");
 /* double block buffers: one in flight on SPI, one being decoded */
 static uint8_t s_block[TX_BLOCKS_IN_FLIGHT][LCD_BLOCK_BYTES];
 
-/* --- column-interlace mode ('i' key) ---------------------------------------
- * The decoder is forward-only, so an interlaced frame is decoded ONCE into
- * a full-frame stage and both half-fields are sliced out of it. The stage
- * lives in PSRAM and is read by the CPU only — DMA always reads the internal
- * s_block buffers, so no PSRAM-DMA/cache concerns. */
-static bool     s_ilace;            /* toggled live with 'i'               */
-static uint8_t *s_ilace_stage;      /* LCD_V_RES * 1440 B, alloc on demand */
+/* --- field pacing ----------------------------------------------------------
+ * The blob is baked at FIELD_HZ_X100/100 fields/s (convert_video.py
+ * --field-rate; 21.70 = the 40 MHz RGB666 wire ceiling), so real-time
+ * playback = one field every 1e8/2170 us. A slower bus simply falls behind
+ * (the clip plays in slow motion — exactly what v5 progressive did below
+ * its 15 fps target). Keep this in sync with the converter default. */
+#define FIELD_HZ_X100   2170
+#define FIELD_US(f)     ((int64_t)(f) * 100000000LL / FIELD_HZ_X100)
 
 /* ================= console helpers (same style as project 1) =========== */
 
@@ -143,7 +148,7 @@ static char poll_key(void)
             return 0;
         }
         char ch = (char)tolower((int)c);
-        if (ch != 0 && strchr("ynrqdi", ch) != NULL) {
+        if (ch != 0 && strchr("ynrqd", ch) != NULL) {
             /* echo + drain the rest of the line */
             printf("%c\n", ch);
             while (uart_read_bytes(CONSOLE_UART, &c, 1, pdMS_TO_TICKS(30)) == 1) {
@@ -160,30 +165,31 @@ typedef struct {
     uint32_t mhz;
     bool     tested;
     bool     pass;
-    uint32_t fps_x10;     /* 0 = not measured */
+    uint32_t fps_x10;     /* fields/s x10; 0 = not measured */
 } step_t;
 
 static step_t s_steps[STEP_COUNT];
 
-/* Push one full progressive frame (320 lines = 20 blocks of 16 lines).
+/* Push one field: a 240-px half-window (half=0 left x 0..239, half=1 right
+ * x 240..479), full height, streamed straight from the decoder in 16-line
+ * DMA blocks — no PSRAM, no staging, ~23 SPI transactions per field.
  * Returns false only if the video decoder hard-fails (corrupt blob). */
-static bool push_frame(void)
+static bool push_field(int half)
 {
     const video_hdr_t *hdr = video_hdr();
-    const size_t stride = (size_t)LCD_H_RES * hdr->bpp;  /* wire bytes/line */
+    const size_t half_stride = (size_t)(LCD_H_RES / 2) * hdr->bpp;  /* 720 */
 
-    /* the window may currently be a HALF window (interlace mode was on) */
-    ESP_ERROR_CHECK(msp3520_prepare_stream());
-    ESP_ERROR_CHECK(msp3520_field_begin());  /* CS low + RAMWR: from row 0 */
+    ESP_ERROR_CHECK(msp3520_prepare_half_stream(half));
+    ESP_ERROR_CHECK(msp3520_field_begin());      /* CS low + RAMWR */
     int live = 0;
-    for (int b = 0; b < FRAME_BLOCKS; b++) {
+    for (int b = 0; b < FRAME_BLOCKS; b++) {     /* 20 x 16 lines = 320 */
         uint8_t *dst = s_block[b & (TX_BLOCKS_IN_FLIGHT - 1)];
         for (int l = 0; l < LCD_BLOCK_LINES; l++) {
-            if (!video_read_line(dst + l * stride)) {
-                /* end of the video inside a frame cannot happen (the blob
-                 * ends on frame boundaries), but be safe and restart */
+            if (!video_read_line(dst + (size_t)l * half_stride)) {
+                /* end of the video inside a field cannot happen (the blob
+                 * ends on field boundaries), but be safe and restart */
                 video_rewind();
-                if (!video_read_line(dst + l * stride)) {
+                if (!video_read_line(dst + (size_t)l * half_stride)) {
                     /* corrupt blob: drain + CS high so the panel and the
                      * SPI queue are in a clean state for the next step */
                     while (live > 0) {
@@ -195,7 +201,8 @@ static bool push_frame(void)
                 }
             }
         }
-        ESP_ERROR_CHECK(msp3520_queue_block(dst));
+        /* a half block is 11,520 B; the s_block rows hold 23,040 B */
+        ESP_ERROR_CHECK(msp3520_queue_half_block(dst));
         if (++live >= TX_BLOCKS_IN_FLIGHT) {
             ESP_ERROR_CHECK(msp3520_retire_block());
             live--;
@@ -206,75 +213,6 @@ static bool push_frame(void)
         live--;
     }
     msp3520_field_end();
-    return true;
-}
-
-/* Push one frame as TWO column-interlaced half-fields (left x 0..239, then
- * right x 240..479), sent back-to-back ~46 ms apart at 40 MHz. Same wire
- * bytes as push_frame() — this is a cadence experiment, not a speedup.
- * Returns false only on a decoder hard-fail (corrupt blob). */
-static bool push_ilace_frame(void)
-{
-    const video_hdr_t *hdr = video_hdr();
-    const size_t stride   = (size_t)LCD_H_RES * hdr->bpp;   /* 1440 (bpp 3) */
-    const size_t half_len = stride / 2;                     /* 720          */
-
-    /* one-time full-frame stage (PSRAM first; CPU-only reads) */
-    if (s_ilace_stage == NULL) {
-        s_ilace_stage = heap_caps_malloc((size_t)LCD_V_RES * stride,
-                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (s_ilace_stage == NULL) {
-            s_ilace_stage = heap_caps_malloc((size_t)LCD_V_RES * stride,
-                                             MALLOC_CAP_8BIT);
-        }
-        if (s_ilace_stage == NULL) {
-            printf("\n  [interlace unavailable: no memory for the frame stage]\n");
-            s_ilace = false;            /* fall back for the next frames */
-            return true;
-        }
-    }
-
-    /* decode the whole frame into the stage once (the decoder is
-     * forward-only, so both halves are sliced out of this one copy) */
-    uint8_t *p = s_ilace_stage;
-    for (int l = 0; l < LCD_V_RES; l++) {
-        if (!video_read_line(p)) {
-            video_rewind();
-            if (!video_read_line(p)) {
-                return false;
-            }
-        }
-        p += stride;
-    }
-
-    for (int half = 0; half < 2; half++) {
-        ESP_ERROR_CHECK(msp3520_prepare_half_stream(half));
-        ESP_ERROR_CHECK(msp3520_field_begin());
-        int live = 0;
-        for (int b = 0; b < FRAME_BLOCKS; b++) {
-            const uint8_t *src = s_ilace_stage
-                               + (size_t)b * LCD_BLOCK_LINES * stride
-                               + (size_t)half * half_len;
-            /* reuse a s_block row as the half-block staging buffer
-             * (11,520 B needed, 23,040 B available) */
-            uint8_t *dst = s_block[b & (TX_BLOCKS_IN_FLIGHT - 1)];
-            for (int l = 0; l < LCD_BLOCK_LINES; l++) {
-                memcpy(dst + (size_t)l * half_len,
-                       src + (size_t)l * stride,
-                       half_len);
-            }
-            ESP_ERROR_CHECK(msp3520_queue_half_block(dst));
-            if (++live >= TX_BLOCKS_IN_FLIGHT) {
-                ESP_ERROR_CHECK(msp3520_retire_block());
-                live--;
-            }
-        }
-        while (live > 0) {
-            ESP_ERROR_CHECK(msp3520_retire_block());
-            live--;
-        }
-        msp3520_field_end();
-    }
     return true;
 }
 
@@ -302,16 +240,16 @@ static void pace_until(int64_t target_us)
 }
 
 /* Play the looping video for `seconds` at the current SPI clock.
- * Frames are paced to 15 per second whenever the bus finishes early; when
- * the bus is slower than that, playback simply runs at whatever the bus
- * allows (measured fps drops below 15).
+ * Fields are paced to FIELD_HZ_X100/100 per second whenever the bus
+ * finishes early (real time for a blob baked at the same rate); when the
+ * bus is slower, playback simply runs at whatever the bus allows.
  * Returns a verdict key ('y','n','r','q') pressed during playback, or 0 if
- * the time simply ran out. Fills *fps_x10 and *frames. */
-static char play_segment(int seconds, uint32_t *frames_out, uint32_t *fps_x10)
+ * the time simply ran out. Fills *fields_out and *rate_x10 (fields/s x10). */
+static char play_segment(int seconds, uint32_t *fields_out, uint32_t *rate_x10)
 {
     const video_hdr_t *hdr = video_hdr();
-    uint32_t frames = 0;
-    uint32_t frame = 0;                 /* frame index 0..hdr->fields */
+    uint32_t fields = 0;
+    uint32_t field = 0;                 /* field index 0..hdr->fields-1 */
     int64_t t0 = esp_timer_get_time();
     int64_t deadline = t0 + (int64_t)seconds * 1000000;
     int64_t next_status = t0 + 500000;
@@ -322,18 +260,20 @@ static char play_segment(int seconds, uint32_t *frames_out, uint32_t *fps_x10)
             break;
         }
 
-        if (s_ilace ? !push_ilace_frame() : !push_frame()) {
+        /* stream one field: even index = left half, odd = right half */
+        if (!push_field((int)(field & 1u))) {
             break;
         }
-        frames++;
-        frame++;
-        if (frame >= hdr->fields) {
-            frame = 0;                  /* loop the video */
+        fields++;
+        field++;
+        if (field >= hdr->fields) {
+            field = 0;                  /* loop the video */
             video_rewind();
         }
 
-        /* natural speed: 15 fps when the bus keeps up */
-        pace_until(t0 + (int64_t)(frames + 1) * (1000000 / 15));
+        /* real time: 21.70 fields/s when the bus keeps up (matches the
+         * converter's --field-rate bake) */
+        pace_until(t0 + FIELD_US(fields));
 
         /* live keys: judge while watching, no need to wait for the end */
         char k = poll_key();
@@ -346,19 +286,10 @@ static char play_segment(int seconds, uint32_t *frames_out, uint32_t *fps_x10)
             printf("\n  [SCK/MOSI GPIO drive capability -> %d]\n", s_drive);
             continue;
         }
-        if (k == 'i') {
-            /* A/B experiment: column-interlaced half-frames. Same bytes per
-             * frame (the fps ceiling cannot move), but the update rate
-             * doubles to ~21.7 fields/s at 40 MHz. Takes effect next frame. */
-            s_ilace = !s_ilace;
-            printf("\n  [%s mode - takes effect next frame]\n",
-                   s_ilace ? "COLUMN-INTERLACED" : "PROGRESSIVE");
-            continue;
-        }
         if (k != 0) {
-            *frames_out = frames;
+            *fields_out = fields;
             int64_t el = esp_timer_get_time() - t0;
-            *fps_x10 = el > 0 ? (uint32_t)((uint64_t)frames * 10 * 1000000 / el) : 0;
+            *rate_x10 = el > 0 ? (uint32_t)((uint64_t)fields * 10 * 1000000 / el) : 0;
             printf("\n");
             return k;
         }
@@ -367,25 +298,19 @@ static char play_segment(int seconds, uint32_t *frames_out, uint32_t *fps_x10)
         if (now >= next_status) {
             int64_t el = now - t0;
             uint32_t f10 = el > 0
-                ? (uint32_t)((uint64_t)frames * 10 * 1000000 / el) : 0;
-            printf("\r  playing: %u frames, ", (unsigned)frames);
+                ? (uint32_t)((uint64_t)fields * 10 * 1000000 / el) : 0;
+            printf("\r  playing: %u fields, ", (unsigned)fields);
             print_x10(f10);
-            printf(" fps");
-            if (s_ilace) {
-                printf(" (");
-                print_x10(f10 * 2);    /* 2 half-frame updates per frame */
-                printf(" upd/s)");
-            }
-            printf("   [y/n/r/q/d/i]");
+            printf(" fields/s   [y/n/r/q/d]");
             fflush(stdout);
             next_status += 500000;
         }
     }
     printf("\n");
 
-    *frames_out = frames;
+    *fields_out = fields;
     int64_t el = esp_timer_get_time() - t0;
-    *fps_x10 = el > 0 ? (uint32_t)((uint64_t)frames * 10 * 1000000 / el) : 0;
+    *rate_x10 = el > 0 ? (uint32_t)((uint64_t)fields * 10 * 1000000 / el) : 0;
     return 0;
 }
 
@@ -394,7 +319,7 @@ static bool run_step(int idx)
 {
     step_t *st = &s_steps[idx];
     char key;
-    uint32_t frames = 0;
+    uint32_t fields = 0;
 
     /* clean panel + fresh clock for every frequency */
     ESP_ERROR_CHECK(msp3520_reinit_panel());
@@ -405,7 +330,7 @@ static bool run_step(int idx)
     printf("\n  [%2d/%d] %2u MHz\n", idx + 1, STEP_COUNT, (unsigned)st->mhz);
 
     for (;;) {
-        key = play_segment(PLAY_SECONDS, &frames, &st->fps_x10);
+        key = play_segment(PLAY_SECONDS, &fields, &st->fps_x10);
         if (key == 'r') {
             video_rewind();
             continue;
@@ -424,7 +349,7 @@ static bool run_step(int idx)
     st->pass = (key == 'y');
     printf("   %2u MHz: ", (unsigned)st->mhz);
     print_x10(st->fps_x10);
-    printf(" fps, %u frames -> %s\n", (unsigned)frames,
+    printf(" fields/s, %u fields -> %s\n", (unsigned)fields,
            st->pass ? "PASS" : "FAIL");
 
     if (key == 'q') {
@@ -441,7 +366,7 @@ static void print_summary(void)
 
     printf("\n");
     printf("  ======================== SUMMARY ========================\n");
-    printf("   MHz      fps     verdict\n");
+    printf("   MHz  fields/s  verdict\n");
     printf("  --------------------------------------------------------\n");
     for (int i = 0; i < STEP_COUNT; i++) {
         const step_t *st = &s_steps[i];
@@ -484,7 +409,7 @@ static void print_summary(void)
 static void cinema_loop(void)
 {
     char line[16];
-    uint32_t frames = 0, fps_x10 = 0;
+    uint32_t fields = 0, rate_x10 = 0;
 
     read_line("\nContinuous playback? Enter SPI MHz (or just Enter to finish) > ",
               line, sizeof(line));
@@ -502,8 +427,8 @@ static void cinema_loop(void)
     video_rewind();
 
     printf("  Playing the video on loop at %ld MHz - press y/n/r/q to stop.\n", f);
-    play_segment(3600, &frames, &fps_x10);
-    printf("  Stopped after %u frames.\n", (unsigned)frames);
+    play_segment(3600, &fields, &rate_x10);
+    printf("  Stopped after %u fields.\n", (unsigned)fields);
 }
 
 /* After the sweep: re-test individual frequencies. */
@@ -529,9 +454,9 @@ static void retest_loop(void)
         video_rewind();
 
         char key;
-        uint32_t frames = 0, fps_x10 = 0;
+        uint32_t fields = 0, rate_x10 = 0;
         for (;;) {
-            key = play_segment(PLAY_SECONDS, &frames, &fps_x10);
+            key = play_segment(PLAY_SECONDS, &fields, &rate_x10);
             if (key == 'r') {
                 video_rewind();
                 continue;
@@ -548,7 +473,7 @@ static void retest_loop(void)
         for (int i = 0; i < STEP_COUNT; i++) {
             if (s_steps[i].mhz == (uint32_t)f) {
                 s_steps[i].tested = true;
-                s_steps[i].fps_x10 = fps_x10;
+                s_steps[i].fps_x10 = rate_x10;
                 s_steps[i].pass = (key == 'y');
                 break;
             }
@@ -565,19 +490,20 @@ static void retest_loop(void)
 static void print_banner(const video_hdr_t *hdr)
 {
     uint32_t blob_kb  = (uint32_t)(video_end - video_start) / 1024;
-    uint32_t raw_kb   = (uint32_t)hdr->frames * (480u * 320u * hdr->bpp) / 1024u;
+    /* raw pixel data: every field is a 240x320 half of a source frame */
+    uint32_t raw_kb   = (uint32_t)hdr->fields * (480u / 2) * 320u * hdr->bpp / 1024u;
     uint32_t ratio10  = (raw_kb * 10 + blob_kb / 2) / blob_kb;   /* rounded */
 
     printf("\n");
     printf("  ============================================================\n");
-    printf("   MSP3520 VIDEO player + SPI clock sweep (v5)\n");
+    printf("   MSP3520 VIDEO player + SPI clock sweep (v6, FIELD-INTERLACED)\n");
     printf("   ESP32-S3 + ESP-IDF  |  sweep %d..%d MHz in %d MHz steps\n",
            FREQ_START_MHZ, FREQ_STOP_MHZ, FREQ_STEP_MHZ);
     printf("  ============================================================\n");
     printf("\n");
-    printf("  Embedded video: %u frames @ 15 fps (%u.%u s), %u fields,\n",
-           (unsigned)hdr->frames, (unsigned)(hdr->frames * 10 / 15 / 10),
-           (unsigned)(hdr->frames * 10 / 15 % 10), (unsigned)hdr->fields);
+    printf("  Embedded video: %u source frames @ 15 fps -> %u fields\n",
+           (unsigned)hdr->frames, (unsigned)hdr->fields);
+    printf("  (one field = one 240-px half of a FRESH source frame),\n");
     printf("  stored in %u KiB (", (unsigned)blob_kb);
     print_x10(ratio10);
     printf("x smaller than the raw %u KiB of pixel data)\n", (unsigned)raw_kb);
@@ -586,19 +512,19 @@ static void print_banner(const video_hdr_t *hdr)
            (unsigned)hdr->bpp, (unsigned)(hdr->bpp == 3 ? 0x66 : 0x55));
     printf("  reality: 35-60 MHz requests run at 40 MHz, 65-80 MHz at\n");
     printf("  80 MHz (no other steps exist).\n");
-    printf("  PROGRESSIVE scan, 16-line DMA blocks: ~25 SPI transactions\n");
-    printf("  per frame (v3 needed 1280 - that overhead cost it ~2 fps).\n");
-    printf("  No combing in progressive mode. Press i to A/B the\n");
-    printf("  column-interlace cadence (21.7 upd/s at 40 MHz; same fps\n");
-    printf("  ceiling - the wire still carries every byte of every\n");
-    printf("  frame, only the update cadence changes).\n");
+    printf("  FIELD-INTERLACED streaming: 16-line DMA blocks into\n");
+    printf("  alternating half-windows (~23 SPI transactions per field).\n");
+    printf("  No PSRAM needed. At 40 MHz expect ~21.7 fields/s (vs ~10.85\n");
+    printf("  full frames/s progressive): every field carries a newer\n");
+    printf("  source sample, so motion advances at double cadence. Trade:\n");
+    printf("  a stationary mid-screen seam; fast pans shear across it by\n");
+    printf("  ~1 field period. Static content: identical to progressive.\n");
     printf("  Noise, torn stripes, wrong colors or freezes\n");
     printf("  are NOT normal - press n.\n");
     printf("\n");
     printf("  Keys work DURING playback (single keypress, no Enter):\n");
     printf("    y  PASS   n  FAIL   r  restart   q  quit sweep\n");
     printf("    d  SCK/MOSI drive cap (80 MHz experiment)\n");
-    printf("    i  column-interlace on/off (cadence experiment)\n");
     printf("\n");
     printf("  Pin map (change in main/msp3520.h):\n");
     printf("    SCK->GPIO%d  MOSI->GPIO%d  MISO->GPIO%d  CS->GPIO%d\n",
@@ -616,6 +542,14 @@ void app_main(void)
 
     if (!video_open(video_start, (uint32_t)(video_end - video_start))) {
         printf("  FATAL: embedded video.bin failed to open (bad header?)\n");
+        return;
+    }
+    if ((video_hdr()->flags & 0x4) == 0) {
+        /* video_open also accepts progressive blobs (flags bit1) so the
+         * decoder stays testable — but THIS player streams fields */
+        printf("  FATAL: v6 streams FIELD-INTERLACED blobs (flags bit2).\n"
+               "  Regenerate video.bin with:\n"
+               "    tools/convert_video.py IN.mp4 main/video.bin --scan field-halves\n");
         return;
     }
     print_banner(video_hdr());

@@ -1,0 +1,50 @@
+MSP3520 video player v6 (FIELD-INTERLACED - double-cadence build)
+=======================================================================
+
+WHAT'S IN THIS FOLDER
+  bootloader.bin                flash to 0x0
+  partition-table.bin           flash to 0x8000
+  msp3520_video_oc_test.bin     flash to 0x10000  (app + embedded video)
+  msp3520_video_oc_test_full.bin  all three merged - flash to 0x0
+
+FLASH (wiring unchanged from v5: SCK=12 MOSI=11 MISO=13 CS=10 DC=9
+RESET=14 LED=47)
+  idf.py -p COMx flash            (from the msp3520-video-oc-test project)
+  or: python -m esptool --chip esp32s3 -b 460800 write-flash 0x0 \
+        bootloader.bin 0x8000 partition-table.bin 0x10000 \
+        msp3520_video_oc_test.bin
+  or: python -m esptool --chip esp32s3 -b 460800 write-flash 0x0 \
+        msp3520_video_oc_test_full.bin
+
+WHAT IT DOES (v6 = the frame-rate interlace you asked for)
+  The video is stored and played as FIELDS: each field is one 240-px
+  half of the screen carrying the source frame at its OWN timestamp
+  (halves alternate left/right, 173 fields from the 119-frame clip).
+  At 40 MHz the wire carries ~21.7 fields/s - double the ~10.85 full
+  frames/s of the progressive builds - and because every field carries
+  a NEWER source sample, motion advances at that doubled cadence.
+  No PSRAM needed: works on every board (N8, N8R2, N16R8 ...).
+
+  EXPECTED ARTIFACTS (the interlace trade you accepted): a stationary
+  vertical seam at mid-screen; during fast horizontal pans the two
+  halves shear by ~46 ms of motion. Static scenes are pixel-identical
+  to the progressive build. Anything beyond that (snow, torn stripes,
+  frozen picture, garbage blocks) is a fault: press n.
+
+  1. Boots, reads the controller ID, fills the screen dark blue.
+  2. Sweeps the video at 10..80 MHz in 5 MHz steps, 10 s per step.
+     Keys DURING playback (single keypress, no Enter):
+     y = clean   n = artifacts   r = restart   q = quit sweep
+     d = cycle SCK/MOSI drive capability (80 MHz experiment)
+  3. Summary table (fields/s per MHz), retest loop (type MHz + Enter),
+     then continuous playback mode (type MHz + Enter).
+
+A/B AGAINST PROGRESSIVE
+  Flash the v5.1 package (msp3520-video-firmware-v5) to compare: same
+  clip, same sweep, progressive full frames at ~10.5 fps / 40 MHz with
+  zero artifacts. v6 doubles the cadence at the cost of the seam.
+
+EMBED YOUR OWN CLIP
+  python3 tools/convert_video.py YOURCLIP.mp4 main/video.bin \
+      --scan field-halves
+  (README section 2; a >= 21.7 fps source shows the full 2x gain)

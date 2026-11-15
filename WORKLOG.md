@@ -357,3 +357,93 @@ about different things:
   Porting the progressive converter is pending; README warns.
 - NOTE: commit 894a3ad contains the pre-fix v5 build (the first chain
   finished during the audit); the follow-up commit carries these fixes.
+## 15. v6 — field-interlaced playback (owner directive: frame rate over artifacts)
+
+**Session context.** 6th+ sandbox recycle this session; the disk-full error
+that preceded the crash was reset by the recycle itself (fresh filesystem,
+15 % used). Everything under my-project survived via the restore snapshot;
+the local git clone (spi-tests/.git) and — critically — the GitHub remote
+URL + credentials lived only in the crashed conversation context and were
+not recoverable from the machine (checked: no gh CLI, no SSH keys, no
+.git-credentials, no credential helper, transcript/db hold only this
+session). Remote state per WORKLOG: v5.1 pushed as 230aa4d. Recovery of
+the local tree was verified before any new work: v5.1 byte audit PASS,
+both zips intact, host decoder gate PASS (54,835,200 bytes byte-identical).
+
+**Owner directive (this session):** "no issue with losing vertical
+resolution and combing — I just want interlacing that allows for better
+frame rate." That rejects v5's honest-cadence-only position and asks for
+the classic interlace trade: fewer bytes per picture in exchange for more
+pictures per second.
+
+**Design.** The wire ceiling at 40 MHz is ~10.85 full RGB666 frames/s
+(460,800 B each) = ~21.7 half-frames/s (230,400 B each). The only
+wire-cheap half-picture shape on the ILI9488 is a contiguous half address
+window — true even/odd row interlace needs CASET+PASET+RAMWR per line
+(1280 tx/frame; the v1–v3 mistake, ~2 fps of pure overhead). So v6:
+
+- **Converter** (`--scan field-halves`, new): the blob is baked as 173
+  fields at 21.70 fields/s (the 40 MHz ceiling; `--field-rate`, kept in
+  sync with `FIELD_HZ_X100` in main.c). Field k = one 240-px half (even k
+  left, odd k right) of the source frame at time k/21.70 — every field
+  carries a fresh temporal sample, one field period after the previous.
+  Blob: 5,304,991 B (v5 progressive: 7,254,058 B — 27 % smaller; raw
+  39,859,200 B → 7.5×). All 119 source frames used; 173 fields sample
+  them at 21.70 Hz.
+- **Format** (MIV2, flags bit2 = field-halves): fields of 320 RLE line
+  blocks whose run counts sum to 240 px. bit1 (progressive) blobs still
+  decode — video_open accepts either layout so the decoder stays
+  testable; main.c requires bit2 and fails loudly otherwise.
+- **Player**: push_field() streams each field straight from the decoder
+  into the half-window (20 DMA blocks of 16 lines, ~23 SPI transactions).
+  The v5 PSRAM frame stage is GONE — the blob holds fields, so the
+  forward-only decoder walks exactly what the wire needs; nothing is
+  staged and no PSRAM is required (the v5 menuconfig owner-action is
+  obsolete). Pacing: 21.70 fields/s (real time at 40 MHz; slower buses
+  run slow-motion, as v5 did below its 15 fps target).
+- **Keys**: 'i' removed (v6 has one playback mode); set is now y n r q d.
+- **Counters**: fields/s everywhere (status line, per-step, summary).
+
+**What it buys, honestly.** At 40 MHz: ~21.7 fields/s vs ~10.85 full
+frames/s — motion advances at double cadence (something moves every ~46 ms
+instead of ~92 ms). Per-pixel update rate is unchanged (~10.85 Hz); the
+15 fps source yields ~15 unique temporal samples/s displayed (vs 10.85
+progressive, +38 %) at 2× cadence — a ≥21.7 fps source would show the
+full 2×. Cost (accepted): stationary mid-screen seam; ~46 ms shear across
+it on fast pans; static scenes pixel-identical to progressive.
+
+**Verification.**
+- Converter roundtrip: all 173 fields byte-identical to the source halves
+  (in-script assert on every field).
+- Host decoder gate: the exact device video.c decodes 55,360 lines
+  (39,859,200 bytes) byte-identical to the Python reference; sha256
+  prefix 9e1bf00086f894ea. PASS.
+- Byte audit v6 (app bin): MADCTL 0x28 + COLMOD 0x66 ×1; no 0x55/0x48
+  regressions; half-window CASET table ×1; key set "ynrqd" ×1 and stale
+  "ynrqdi" ×0; embedded blob header (MIV2, flags=4, fields=173) ×1. PASS.
+- Build: ESP-IDF v6.1, app size ~5.6 MB (v5: 7.14 MB) — extra flash
+  headroom.
+
+**Also this session:** the progressive/field-halves converter and the
+host test harness were ported into the repo's tools/ (the copy there was
+still the stale v1–v3 MIV1 converter — the pending port noted in the v5.1
+README section 2 is done; tools/host_test_video.py now uses portable
+paths).
+
+**Owner validation (post-flash, hardware).** v6 was flashed and judged on
+the real panel: "certainly looks better... honestly quite fluid until
+heavy motion where it flickers in the middle — but I don't care." The
+doubled cadence is perceived as fluid; the mid-seam flicker under heavy
+motion is the accepted trade. v6 is the keeper.
+
+**Board direction.** The MSP3520 + ESP32-S3 combo is now the PROTOTYPE
+board (the panel: "torture screen — scammed me out of 14 bucks"). Next
+hardware: a MIPI DSI panel on a Wireless Tag ESP32-P4/C61 — DSI removes
+the 40 MHz 1-bit SPI ceiling entirely, so the v6 compression pipeline
+(LZSS+RLE, field layout) becomes the reusable part, not the transport.
+
+**Pending owner actions.** (1) ~~Flash v6 and A/B~~ DONE (validated
+above). (2) 80 MHz d-key + series-R experiment: still open, now on the
+torture screen. (3) DSI panel: model chosen (Wireless Tag P4/C61 host);
+bring-up when it arrives. The PSRAM menuconfig step from v5 is obsolete
+(v6 needs no PSRAM).

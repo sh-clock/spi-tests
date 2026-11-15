@@ -16,9 +16,15 @@
  * The LZSS stream decodes into an RLE byte stream. The RLE stream is a
  * sequence of LINE blocks: each line block is a series of runs
  *   [count-1][px...]   (count = 1..256 pixels of one color, bpp bytes each)
- * whose counts sum to exactly `width` pixels. With flags bit1 set
- * (progressive — the only layout this player accepts) a FRAME is
- * `height` = 320 consecutive line blocks, frames back to back.
+ * Scan layouts (flags):
+ *   bit1 (progressive): a FRAME is `height` = 320 line blocks of `width`
+ *     = 480 pixels, frames back to back (v4/v5 players).
+ *   bit2 (field-halves, v6 — the only layout THIS player accepts): a
+ *     FIELD is `height` = 320 line blocks of `width`/2 = 240 pixels,
+ *     fields back to back. Field 0, 2, 4... are the LEFT half (x 0..239),
+ *     odd fields the RIGHT half (x 240..479) — and every field carries
+ *     the source frame at its own timestamp, so consecutive fields are
+ *     one field period apart in content (field-native interlacing).
  *
  * LZSS token format (verified byte-identical on the host):
  *   1 flag byte per 8 tokens, MSB first
@@ -30,7 +36,7 @@
  *
  * Usage:
  *   video_open(blob, len);                  // once at boot
- *   video_read_line(buf);                   // 160x per field
+ *   video_read_line(buf);                   // 320x per field
  *   video_rewind();                         // loop back to field 0
  */
 #pragma once
@@ -46,9 +52,9 @@ typedef struct __attribute__((packed)) {
     uint16_t width;         /* 480                                      */
     uint16_t height;        /* 320                                      */
     uint16_t frames;        /* number of source frames                  */
-    uint16_t flags;         /* bit1: 1 = progressive (v4 player needs it) */
+    uint16_t flags;         /* bit1: progressive, bit2: field-halves (v6) */
     uint32_t rle_len;       /* decoded RLE stream size in bytes         */
-    uint32_t fields;        /* == frames (progressive blobs)            */
+    uint32_t fields;        /* progressive: == frames; v6: half-frames  */
     uint32_t bpp;           /* wire bytes/px: 3 = RGB666 (SPI), 2 = RGB565  */
 } video_hdr_t;
 
