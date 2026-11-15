@@ -447,3 +447,77 @@ above). (2) 80 MHz d-key + series-R experiment: still open, now on the
 torture screen. (3) DSI panel: model chosen (Wireless Tag P4/C61 host);
 bring-up when it arrives. The PSRAM menuconfig step from v5 is obsolete
 (v6 needs no PSRAM).
+## 16. Research: visually-better signal over reduced bandwidth (2026-11-15, 6 parallel agents)
+
+Owner brief: trawl for techniques that trade imperceptible information for
+bandwidth (like interlacing), with feasibility verdicts for the S3/SPI
+system. Six agents: analog broadcast, perceptual codecs, foveated/partial
+update, display temporal tricks, chroma/dither, retro/demoscene-embedded.
+
+Frame — on this system there are exactly three currencies:
+1. WIRE (~5 MB/s at 40 MHz): the ONLY fps lever; fewer pixels per update
+   is the only move (clock capped, 3 B/px forced by COLMOD 0x66 on serial).
+2. FLASH (8 MB slot, 5.3 MB used): blob size buys clip length, not fps.
+3. QUALITY PER BYTE: dithering, quantization policy, cadence.
+
+Verdicts:
+
+- **Dirty-rectangle / motion-weighted window scheduling — the top fps
+  lever.** The ILI9488 GRAM persists; static regions need no re-sends.
+  Generalizes v6's fixed half-windows into per-field baked window lists
+  (CASET/PASET per window, 16-line DMA blocks unchanged). Small moving
+  regions can refresh far faster than 21.7 Hz (a 240×160 window = 23 ms of
+  wire ≈ 43 Hz). Content-dependent: a full-screen pan (worst case)
+  degenerates to today's field-interlace. Sources: LVGL dirty-rect refresh
+  (https://lvgl.io/docs/open/main-modules/display/refreshing), Guenter et
+  al. foveated 3D graphics (microsoft.com research), eDP panel self-refresh,
+  CDTech SPI-TFT partial-update engineering notes.
+- **Bayer/ordered dither before the R5G6B5 quantization — top quality-per-
+  byte win.** ≈+2 perceived bits (kills the gradient banding users actually
+  notice on small TFTs), zero runtime cost, and the repetitive patterns
+  compress BETTER under RLE/LZSS. Error diffusion rejected for video
+  (temporal shimmer, worse compression). (Wikipedia: ordered dithering,
+  FRC; crystalfontz RGB565-vs-666 field reports.)
+- **Offline cadence correction** — minterpolate to 21.7 fields/s or
+  deliberate motion-blur blending; targets the dominant low-field-rate
+  artifact (judder + the heavy-motion seam flicker the owner observed).
+  Free (conversion only). (TFT Central / Blur Busters: BFI cannot fix
+  stutter; interpolation/blur does.)
+- **Motion-adaptive quantization + artifact mobility** — coarse quantize
+  fast fields (temporal masking), finest on stills; alternate dither/chroma
+  phase per field PAL-style so residual error averages instead of parking.
+  Encoder-only. (x265 aq-mode docs; arXiv 2112.12284; PAL phase alternation.)
+- **Blob-size levers (NOT fps):** G-full/R+B-half chroma packing (~30-50%
+  smaller blob), HAM-style 2 B/px channel-delta packing (~33%), film-grain
+  stripping offline. CORRECTION to one agent's conclusion: 2 B/px packing
+  does NOT raise fps — the wire is fixed 3 B/px (RGB565/COLMOD 0x55 is
+  parallel-only on the ILI9488, blank screen over SPI; established §12);
+  these buy clip length in the 8 MB slot only.
+- **Rejected, with reasons:** temporal dithering/FRC (pixel regions refresh
+  ~10 Hz → visible ~5 Hz flicker); backlight strobing/BFI (21 Hz flicker,
+  no TE line to phase against the panel scan; software BFI costs wire);
+  runtime FRUC and MPEG-class decode (240 MHz budget — ESPFLIX needed
+  MPEG1 at reduced res with everything else dropped); panel-side
+  scaling/CLUT/PenTile sub-channels (ILI9488 has none; RGB666 serial writes
+  are pixel-atomic).
+
+Task B confirmations (same session):
+- v6 runs at 94.9% of the 40 MHz wire ceiling (20.6 of 21.70 fields/s);
+  the ~5% residual is per-transaction overhead + field ramp/drain. The
+  decoder is 2-3× faster than the wire and streaming is zero-copy
+  (decoder writes straight into DMA block buffers). No worthwhile headroom
+  remains on this transport.
+- **Real 60 MHz SPI is impossible, twice over.** (1) S3 GPSPI synthesizer
+  (spi_ll_master_cal_clock in esp-idf): 80 MHz source, either undivided
+  (requests > 60 MHz produce exactly 80) or ÷(pre×n) integers (pre 1-16,
+  n 2-64) → representable clocks {80, 40, 26.7, 20, 16, ...}; nothing
+  exists between 40 and 80 — 60 would need a 4/3 ratio. Matches the
+  measured sweep: 35-60 MHz requests behave as 40 MHz, 65-80 as 80.
+  (2) ILI9488 datasheet §17.4.3: twc = 50 ns min serial write cycle =
+  20 MHz spec max — 40 MHz is already 2× over spec (works on this
+  specimen), 80 is 4× (snow, measured).
+
+Next: the prototype board stays on v6. The dirty-rectangle generalization
+(v7) is the only remaining SPI-side fps project if wanted; the P4/DSI
+board removes the wire constraint entirely and inherits the blob codec
+plus everything above.
