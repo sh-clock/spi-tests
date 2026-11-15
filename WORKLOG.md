@@ -335,3 +335,25 @@ about different things:
   updated for v4 — "combing is normal", 5.4 MB blob, queue_line API) and
   the firmware banner still said "interlaced VIDEO player". Both likely
   fed the interlacing confusion. README rewritten for v5; banner fixed.
+
+**v5 audit round (3 parallel agents — all findings applied):**
+- Interlace engine itself: NO bugs (logic/timing clean; datasheet 6/6
+  CONFIRMED incl. Figure-129 axis mapping, RAMWR reset, CS pause,
+  exact 76,800-px count; edge cases clean).
+- FIXED: (a) NUL byte passed the strchr key check — one noise byte
+  could silently FAIL a sweep step (ask_key/poll_key now guard ch!=0);
+  (b) push_frame hard-fail (corrupt blob only) left CS low + one
+  queued tx — now drains and raises CS first; (c) "~41 SPI
+  transactions/frame" was wrong — 25 is correct (4 window polls +
+  RAMWR + 20 blocks); (d) video.h contract was stale (progressive
+  MIV2 writes fields == frames; shipped blob verified frames=119,
+  fields=119, flags=2, bpp=3).
+- DECIDED (not changed): SPIRAM stays OFF in sdkconfig.defaults —
+  enabling it blind (quad vs octal, module variant unknown) could
+  boot-loop the owner's board. 'i' needs a one-time menuconfig enable;
+  README/FLASH-INSTRUCTIONS now say so. Safety-first call.
+- KNOWN GAP: repo tools/convert_video.py is still the legacy MIV1
+  converter (blobs the player rejects); shipped video.bin is MIV2.
+  Porting the progressive converter is pending; README warns.
+- NOTE: commit 894a3ad contains the pre-fix v5 build (the first chain
+  finished during the audit); the follow-up commit carries these fixes.

@@ -9,17 +9,16 @@
  *   offset 8   u16 frames           e.g. 119
  *   offset 10  u16 flags            bit0: 0 = even display lines first
  *   offset 12  u32 rle_len          size of the decoded RLE stream (bytes)
- *   offset 16  u32 fields           frames * 2
+ *   offset 16  u32 fields           == frames (progressive blobs)
  *   offset 20  u32 bpp              (2 = RGB565 wire format)
  *   offset 24  LZSS stream
  *
  * The LZSS stream decodes into an RLE byte stream. The RLE stream is a
  * sequence of LINE blocks: each line block is a series of runs
- *   [count-1][hi][lo]       (count = 1..256 pixels of one 16-bit color)
- * whose counts sum to exactly `width` pixels. A display FIELD (half a
- * frame in the interlaced sense) is `height/2` = 160 line blocks. Field 0
- * holds the EVEN display rows (0, 2, 4, ...), field 1 the ODD rows
- * (1, 3, 5, ...), field 2 the even rows of frame 2, and so on.
+ *   [count-1][px...]   (count = 1..256 pixels of one color, bpp bytes each)
+ * whose counts sum to exactly `width` pixels. With flags bit1 set
+ * (progressive — the only layout this player accepts) a FRAME is
+ * `height` = 320 consecutive line blocks, frames back to back.
  *
  * LZSS token format (verified byte-identical on the host):
  *   1 flag byte per 8 tokens, MSB first
@@ -49,7 +48,7 @@ typedef struct __attribute__((packed)) {
     uint16_t frames;        /* number of source frames                  */
     uint16_t flags;         /* bit1: 1 = progressive (v4 player needs it) */
     uint32_t rle_len;       /* decoded RLE stream size in bytes         */
-    uint32_t fields;        /* frames * 2                               */
+    uint32_t fields;        /* == frames (progressive blobs)            */
     uint32_t bpp;           /* wire bytes/px: 3 = RGB666 (SPI), 2 = RGB565  */
 } video_hdr_t;
 

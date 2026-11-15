@@ -37,7 +37,11 @@ step-by-step install guide if you haven't set up ESP-IDF yet). Quick table:
 inside the firmware image, so the app is ~7.5 MB. The standard
 ESP32-S3-DevKitC-1 has 8 MB of flash (N8/N8R2 and N16 modules all work).
 **The `i` (interlace) mode additionally needs PSRAM** for its frame stage
-(N8R2/N8R8 class); without PSRAM it reports that and stays progressive.
+(N8R2/N8R8 class modules). PSRAM is **off in the default build** (so the
+sweep runs on every board); to use `i`, enable it once via
+`idf.py menuconfig` → Component config → ESP PSRAM (quad mode for N8R2,
+octal for N8R8), then rebuild. Without it, `i` prints
+`interlace unavailable` and playback stays progressive.
 
 ---
 
@@ -49,9 +53,9 @@ the sweep) carries 3.6864 Mbit per frame → **~10.8 fps is the hard
 ceiling** for fullscreen RGB666, whatever the firmware does.
 
 **Default (progressive):** each frame is ONE full-screen update — the
-address window is set once, then one RAMWR + 20 pure-data DMA blocks of
-16 lines. ~10.5 fps measured at 40 MHz. No interlacing artifacts of any
-kind.
+address window is re-asserted, then one RAMWR + 20 pure-data DMA blocks of
+16 lines (25 SPI transactions per frame; v3 needed 1280). ~10.5 fps
+measured at 40 MHz. No interlacing artifacts of any kind.
 
 **Press `i` (column-interlace):** each frame goes out as TWO half-screen
 updates — the left 240-px half, then the right half ~46 ms later. Each
@@ -127,6 +131,12 @@ filters). Keep the output under ~7 MB (the script prints the size and
 verifies the roundtrip every time). Then rebuild and re-flash.
 Requirements: Python 3 with `numpy` and `Pillow`, plus a working `ffmpeg`.
 
+> **Repo status note:** the converter copy in this repo is still the
+> v1–v3 version (magic `MIV1`, even/odd field layout) — it produces
+> blobs this player **rejects** by design. The shipped `video.bin` is
+> already the progressive `MIV2` format. Porting the progressive
+> converter into the repo is pending; ask, and it will be finished.
+
 ---
 
 ## 3. Build, flash, run
@@ -147,7 +157,7 @@ The console session looks like this:
    ESP32-S3 + ESP-IDF  |  sweep 10..80 MHz in 5 MHz steps
   ============================================================
 
-  Embedded video: 119 frames @ 15 fps (7.9 s), 238 fields,
+  Embedded video: 119 frames @ 15 fps (7.9 s), 119 fields,
   stored in 7084 KiB (7.6x smaller than the raw 53549 KiB of pixel data)
 
   Wire format: 3 bytes/pixel (COLMOD 0x66). S3 clock
@@ -226,7 +236,7 @@ passes here will pass anything you throw at it later.
 | Boot screen (dark blue) never appears | Wiring: see the first project's troubleshooting table (LED/backlight, DC/RESET, SCK/MOSI). |
 | Video plays but rows look shuffled / halves swapped | That would be a driver bug, not overclocking — re-check the wiring first (SCK and MOSI are adjacent on both headers and easy to swap). |
 | fps stuck far below the table values at high MHz | Signal quality: shorter wires, reseat jumpers; at the 65–80 steps also try the `d` key + a 47–100 Ω series resistor on SCK. |
-| `[interlace unavailable: no memory for the frame stage]` | Your module has no PSRAM (N8) — interlace mode needs it; progressive mode is unaffected. |
+| `[interlace unavailable: no memory for the frame stage]` | Either the module has no PSRAM (N8), or PSRAM is not enabled in the build — the default build ships with it OFF so the sweep works on every board. Menuconfig → Component config → ESP PSRAM, then rebuild (§1). |
 | Seam/shear visible in `i` mode | Expected during fast motion (§1); press `i` again to return to progressive. |
 | Video loops with a visible jump | Normal: the clip is 7.9 s and loops. |
 

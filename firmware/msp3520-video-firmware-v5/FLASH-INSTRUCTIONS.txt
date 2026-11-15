@@ -53,9 +53,11 @@ THE 'i' EXPERIMENT - WHAT IT CAN AND CANNOT DO
   ~46 ms of motion apart (shear at the seam). Static content:
   identical to progressive.
 
-  Requires PSRAM (the frame stage lives there - ESP32-S3 N8R2 or
-  N8R8 class). Without PSRAM the firmware says so and stays
-  progressive.
+  Requires PSRAM for the frame stage. NOTE: the default build ships
+  with PSRAM OFF (so the sweep runs on every board). If pressing i
+  prints "interlace unavailable": idf.py menuconfig -> Component
+  config -> ESP PSRAM -> tick Enable, set the mode to match your
+  module (quad = N8R2, octal = N8R8), rebuild, re-flash.
 
 THE 80 MHz EXPERIMENT (unchanged from v4.1)
   The 65-80 MHz steps all run at 80 MHz actual (the S3 has no SPI

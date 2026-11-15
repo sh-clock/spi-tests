@@ -2,9 +2,9 @@
  * main.c — MSP3520 progressive video player + SPI clock sweep.
  *
  * Plays the converted video (embedded video.bin, 480x320, 15 fps source)
- * as full progressive frames: the whole-display address window is set once
- * (msp3520_prepare_stream), then each frame is ONE RAMWR followed by pure
- * pixel data in 16-line DMA blocks — 41 SPI transactions per frame instead
+ * as full progressive frames: the full-display address window is re-asserted
+ * (msp3520_prepare_stream — required after interlace frames), then ONE RAMWR
+ * + pure pixel data in 16-line DMA blocks — 25 SPI transactions per frame instead
  * of the 1280 the v3 per-line protocol needed (that transaction overhead
  * was worth ~12 ms/field — the reason v3 measured 8.5 fps at 40 MHz).
  * Default mode is progressive (no combing). 'i' toggles COLUMN-interlaced
@@ -96,7 +96,7 @@ static char ask_key(const char *prompt, const char *valid)
             continue;
         }
         char ch = (char)tolower((int)c);
-        if (strchr(valid, ch) != NULL) {
+        if (ch != 0 && strchr(valid, ch) != NULL) {
             printf("%c\n", ch);
             while (uart_read_bytes(CONSOLE_UART, &c, 1, pdMS_TO_TICKS(30)) == 1) {
                 /* swallow trailing Enter */
@@ -143,7 +143,7 @@ static char poll_key(void)
             return 0;
         }
         char ch = (char)tolower((int)c);
-        if (strchr("ynrqdi", ch) != NULL) {
+        if (ch != 0 && strchr("ynrqdi", ch) != NULL) {
             /* echo + drain the rest of the line */
             printf("%c\n", ch);
             while (uart_read_bytes(CONSOLE_UART, &c, 1, pdMS_TO_TICKS(30)) == 1) {
@@ -184,6 +184,13 @@ static bool push_frame(void)
                  * ends on frame boundaries), but be safe and restart */
                 video_rewind();
                 if (!video_read_line(dst + l * stride)) {
+                    /* corrupt blob: drain + CS high so the panel and the
+                     * SPI queue are in a clean state for the next step */
+                    while (live > 0) {
+                        msp3520_retire_block();
+                        live--;
+                    }
+                    msp3520_field_end();
                     return false;
                 }
             }
@@ -579,7 +586,7 @@ static void print_banner(const video_hdr_t *hdr)
            (unsigned)hdr->bpp, (unsigned)(hdr->bpp == 3 ? 0x66 : 0x55));
     printf("  reality: 35-60 MHz requests run at 40 MHz, 65-80 MHz at\n");
     printf("  80 MHz (no other steps exist).\n");
-    printf("  PROGRESSIVE scan, 16-line DMA blocks: ~41 SPI transactions\n");
+    printf("  PROGRESSIVE scan, 16-line DMA blocks: ~25 SPI transactions\n");
     printf("  per frame (v3 needed 1280 - that overhead cost it ~2 fps).\n");
     printf("  No combing in progressive mode. Press i to A/B the\n");
     printf("  column-interlace cadence (21.7 upd/s at 40 MHz; same fps\n");
