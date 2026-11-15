@@ -1,0 +1,79 @@
+MSP3520 video player v5 (column-interlace A/B + 80 MHz experiment build)
+=======================================================================
+
+WHAT'S IN THIS FOLDER
+  bootloader.bin                flash to 0x0
+  partition-table.bin           flash to 0x8000
+  msp3520_video_oc_test.bin     flash to 0x10000  (app + embedded video)
+  msp3520_video_oc_test_full.bin  all three merged - flash to 0x0
+
+FLASH (pick one; wiring is unchanged from the earlier builds:
+SCK=12 MOSI=11 MISO=13 CS=10 DC=9 RESET=14 LED=47)
+  idf.py -p COMx flash            (from the msp3520-video-oc-test project)
+  or: python -m esptool --chip esp32s3 -b 460800 write-flash 0x0 \
+        bootloader.bin 0x8000 partition-table.bin 0x10000 \
+        msp3520_video_oc_test.bin
+  or: python -m esptool --chip esp32s3 -b 460800 write-flash 0x0 \
+        msp3520_video_oc_test_full.bin
+
+WHAT IT DOES
+  1. Boots, reads the controller ID, fills the screen dark blue.
+  2. Sweeps the same 119-frame video at 10..80 MHz in 5 MHz steps,
+     10 s per step. Press keys DURING playback (single keypress,
+     no Enter): y = clean, n = artifacts, r = restart, q = quit.
+  3. Prints a summary table, then a retest loop (type MHz + Enter),
+     then a continuous-playback mode (type MHz + Enter).
+
+KEYS DURING PLAYBACK
+  y = clean    n = artifacts   r = restart video   q = quit sweep
+  d = cycle SCK/MOSI drive capability 0..3 (80 MHz experiment)
+  i = TOGGLE COLUMN-INTERLACE on/off (new in v5, below)
+
+THE 'i' EXPERIMENT - WHAT IT CAN AND CANNOT DO
+  Default (progressive): every frame is one full-screen update,
+  ~10.5 fps at 40 MHz - the RGB666 wire ceiling for this panel.
+  Press i: each frame is sent as TWO half-screen updates - the left
+  240-px half, then the right half ~46 ms later. The update rate
+  doubles to ~21 per second; the status line shows both numbers,
+  e.g. "10.3 fps (20.6 upd/s)".
+
+  HONEST PHYSICS (research-verified, see WORKLOG sections 12/14):
+  the wire still carries every byte of every frame, so the frame
+  rate ceiling does NOT change, and no pixel updates faster than
+  ~10.85 Hz. Interlacing halves the bytes per FIELD, never the
+  bytes per PICTURE - it cannot create frames the source does not
+  have. What may improve is perceived cadence (regular ~46 ms
+  updates instead of irregular full-frame steps); whether that
+  looks smoother is content-dependent and a matter of taste.
+  Judge with your own eyes: play the same MHz step with i off,
+  then on.
+
+  Expected artifacts in interlaced mode: a stationary vertical seam
+  at mid-screen; during fast horizontal pans the two sides can be
+  ~46 ms of motion apart (shear at the seam). Static content:
+  identical to progressive.
+
+  Requires PSRAM (the frame stage lives there - ESP32-S3 N8R2 or
+  N8R8 class). Without PSRAM the firmware says so and stays
+  progressive.
+
+THE 80 MHz EXPERIMENT (unchanged from v4.1)
+  The 65-80 MHz steps all run at 80 MHz actual (the S3 has no SPI
+  clock between 40 and 80). If they show snow:
+    1. press d repeatedly while watching - weaker SCK/MOSI edges
+       (settings 0/1) ring less on jumper wires
+    2. 47-100 ohm series resistor in the SCK line at the ESP32 end
+    3. a GND jumper routed alongside SCK; keep wires under 10 cm
+  Research verdict: LOW-MEDIUM odds (the ILI9488 die is 4x out of
+  spec at 80 MHz; 40 MHz is the highest reliably reported SPI clock
+  for this controller anywhere) - but this is the only remaining
+  $0 path to 15 fps on this module, so it is worth the attempt.
+
+EXPECTED NUMBERS (40 MHz actual = the 35..60 MHz steps)
+  progressive : ~10.5 fps
+  interlaced  : ~10.2-10.5 fps, ~20.5-21 upd/s (the stage decode is
+                not overlapped, costing a few percent vs theory)
+  10 MHz      : ~2.7 fps / ~5.4 upd/s (plenty for judging artifacts)
+
+If interlaced mode looks WORSE, just leave it off - progressive is
+the default and nothing else changed.

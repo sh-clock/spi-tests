@@ -7,8 +7,12 @@
  * pixel data in 16-line DMA blocks — 41 SPI transactions per frame instead
  * of the 1280 the v3 per-line protocol needed (that transaction overhead
  * was worth ~12 ms/field — the reason v3 measured 8.5 fps at 40 MHz).
- * No interlacing, no combing. Corruption (noise, stripes, wrong colors)
- * IS a fault: press n.
+ * Default mode is progressive (no combing). 'i' toggles COLUMN-interlaced
+ * mode: each frame goes out as two 240-px half-frames ~46 ms apart — the
+ * SAME bytes per frame, so the fps ceiling does NOT change (interlacing
+ * halves bytes per field, never bytes per picture); it doubles the update
+ * rate to ~21.7 fields/s at 40 MHz. Cadence A/B experiment — see README.
+ * Corruption (noise, stripes, wrong colors) IS a fault: press n.
  *
  * The sweep runs the SAME video at 10..80 MHz SPI clock, 5 MHz steps. At
  * each frequency the video loops for PLAY_SECONDS while you watch; press
@@ -31,6 +35,7 @@
 #include "freertos/task.h"
 #include "esp_timer.h"
 #include "driver/uart.h"
+#include "esp_heap_caps.h"
 
 #include "msp3520.h"
 #include "video.h"
@@ -57,6 +62,14 @@ extern const uint8_t video_end[]   asm("_binary_video_bin_end");
 
 /* double block buffers: one in flight on SPI, one being decoded */
 static uint8_t s_block[TX_BLOCKS_IN_FLIGHT][LCD_BLOCK_BYTES];
+
+/* --- column-interlace mode ('i' key) ---------------------------------------
+ * The decoder is forward-only, so an interlaced frame is decoded ONCE into
+ * a full-frame stage and both half-fields are sliced out of it. The stage
+ * lives in PSRAM and is read by the CPU only — DMA always reads the internal
+ * s_block buffers, so no PSRAM-DMA/cache concerns. */
+static bool     s_ilace;            /* toggled live with 'i'               */
+static uint8_t *s_ilace_stage;      /* LCD_V_RES * 1440 B, alloc on demand */
 
 /* ================= console helpers (same style as project 1) =========== */
 
@@ -130,7 +143,7 @@ static char poll_key(void)
             return 0;
         }
         char ch = (char)tolower((int)c);
-        if (strchr("ynrqd", ch) != NULL) {
+        if (strchr("ynrqdi", ch) != NULL) {
             /* echo + drain the rest of the line */
             printf("%c\n", ch);
             while (uart_read_bytes(CONSOLE_UART, &c, 1, pdMS_TO_TICKS(30)) == 1) {
@@ -159,6 +172,8 @@ static bool push_frame(void)
     const video_hdr_t *hdr = video_hdr();
     const size_t stride = (size_t)LCD_H_RES * hdr->bpp;  /* wire bytes/line */
 
+    /* the window may currently be a HALF window (interlace mode was on) */
+    ESP_ERROR_CHECK(msp3520_prepare_stream());
     ESP_ERROR_CHECK(msp3520_field_begin());  /* CS low + RAMWR: from row 0 */
     int live = 0;
     for (int b = 0; b < FRAME_BLOCKS; b++) {
@@ -184,6 +199,75 @@ static bool push_frame(void)
         live--;
     }
     msp3520_field_end();
+    return true;
+}
+
+/* Push one frame as TWO column-interlaced half-fields (left x 0..239, then
+ * right x 240..479), sent back-to-back ~46 ms apart at 40 MHz. Same wire
+ * bytes as push_frame() — this is a cadence experiment, not a speedup.
+ * Returns false only on a decoder hard-fail (corrupt blob). */
+static bool push_ilace_frame(void)
+{
+    const video_hdr_t *hdr = video_hdr();
+    const size_t stride   = (size_t)LCD_H_RES * hdr->bpp;   /* 1440 (bpp 3) */
+    const size_t half_len = stride / 2;                     /* 720          */
+
+    /* one-time full-frame stage (PSRAM first; CPU-only reads) */
+    if (s_ilace_stage == NULL) {
+        s_ilace_stage = heap_caps_malloc((size_t)LCD_V_RES * stride,
+                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (s_ilace_stage == NULL) {
+            s_ilace_stage = heap_caps_malloc((size_t)LCD_V_RES * stride,
+                                             MALLOC_CAP_8BIT);
+        }
+        if (s_ilace_stage == NULL) {
+            printf("\n  [interlace unavailable: no memory for the frame stage]\n");
+            s_ilace = false;            /* fall back for the next frames */
+            return true;
+        }
+    }
+
+    /* decode the whole frame into the stage once (the decoder is
+     * forward-only, so both halves are sliced out of this one copy) */
+    uint8_t *p = s_ilace_stage;
+    for (int l = 0; l < LCD_V_RES; l++) {
+        if (!video_read_line(p)) {
+            video_rewind();
+            if (!video_read_line(p)) {
+                return false;
+            }
+        }
+        p += stride;
+    }
+
+    for (int half = 0; half < 2; half++) {
+        ESP_ERROR_CHECK(msp3520_prepare_half_stream(half));
+        ESP_ERROR_CHECK(msp3520_field_begin());
+        int live = 0;
+        for (int b = 0; b < FRAME_BLOCKS; b++) {
+            const uint8_t *src = s_ilace_stage
+                               + (size_t)b * LCD_BLOCK_LINES * stride
+                               + (size_t)half * half_len;
+            /* reuse a s_block row as the half-block staging buffer
+             * (11,520 B needed, 23,040 B available) */
+            uint8_t *dst = s_block[b & (TX_BLOCKS_IN_FLIGHT - 1)];
+            for (int l = 0; l < LCD_BLOCK_LINES; l++) {
+                memcpy(dst + (size_t)l * half_len,
+                       src + (size_t)l * stride,
+                       half_len);
+            }
+            ESP_ERROR_CHECK(msp3520_queue_half_block(dst));
+            if (++live >= TX_BLOCKS_IN_FLIGHT) {
+                ESP_ERROR_CHECK(msp3520_retire_block());
+                live--;
+            }
+        }
+        while (live > 0) {
+            ESP_ERROR_CHECK(msp3520_retire_block());
+            live--;
+        }
+        msp3520_field_end();
+    }
     return true;
 }
 
@@ -231,7 +315,7 @@ static char play_segment(int seconds, uint32_t *frames_out, uint32_t *fps_x10)
             break;
         }
 
-        if (!push_frame()) {
+        if (s_ilace ? !push_ilace_frame() : !push_frame()) {
             break;
         }
         frames++;
@@ -255,6 +339,15 @@ static char play_segment(int seconds, uint32_t *frames_out, uint32_t *fps_x10)
             printf("\n  [SCK/MOSI GPIO drive capability -> %d]\n", s_drive);
             continue;
         }
+        if (k == 'i') {
+            /* A/B experiment: column-interlaced half-frames. Same bytes per
+             * frame (the fps ceiling cannot move), but the update rate
+             * doubles to ~21.7 fields/s at 40 MHz. Takes effect next frame. */
+            s_ilace = !s_ilace;
+            printf("\n  [%s mode - takes effect next frame]\n",
+                   s_ilace ? "COLUMN-INTERLACED" : "PROGRESSIVE");
+            continue;
+        }
         if (k != 0) {
             *frames_out = frames;
             int64_t el = esp_timer_get_time() - t0;
@@ -270,7 +363,13 @@ static char play_segment(int seconds, uint32_t *frames_out, uint32_t *fps_x10)
                 ? (uint32_t)((uint64_t)frames * 10 * 1000000 / el) : 0;
             printf("\r  playing: %u frames, ", (unsigned)frames);
             print_x10(f10);
-            printf(" fps   [y/n/r/q/d=drive]");
+            printf(" fps");
+            if (s_ilace) {
+                printf(" (");
+                print_x10(f10 * 2);    /* 2 half-frame updates per frame */
+                printf(" upd/s)");
+            }
+            printf("   [y/n/r/q/d/i]");
             fflush(stdout);
             next_status += 500000;
         }
@@ -464,7 +563,7 @@ static void print_banner(const video_hdr_t *hdr)
 
     printf("\n");
     printf("  ============================================================\n");
-    printf("   MSP3520 interlaced VIDEO player + SPI clock sweep\n");
+    printf("   MSP3520 VIDEO player + SPI clock sweep (v5)\n");
     printf("   ESP32-S3 + ESP-IDF  |  sweep %d..%d MHz in %d MHz steps\n",
            FREQ_START_MHZ, FREQ_STOP_MHZ, FREQ_STEP_MHZ);
     printf("  ============================================================\n");
@@ -482,11 +581,17 @@ static void print_banner(const video_hdr_t *hdr)
     printf("  80 MHz (no other steps exist).\n");
     printf("  PROGRESSIVE scan, 16-line DMA blocks: ~41 SPI transactions\n");
     printf("  per frame (v3 needed 1280 - that overhead cost it ~2 fps).\n");
-    printf("  No combing. Noise, torn stripes, wrong colors or freezes\n");
+    printf("  No combing in progressive mode. Press i to A/B the\n");
+    printf("  column-interlace cadence (21.7 upd/s at 40 MHz; same fps\n");
+    printf("  ceiling - the wire still carries every byte of every\n");
+    printf("  frame, only the update cadence changes).\n");
+    printf("  Noise, torn stripes, wrong colors or freezes\n");
     printf("  are NOT normal - press n.\n");
     printf("\n");
     printf("  Keys work DURING playback (single keypress, no Enter):\n");
     printf("    y  PASS   n  FAIL   r  restart   q  quit sweep\n");
+    printf("    d  SCK/MOSI drive cap (80 MHz experiment)\n");
+    printf("    i  column-interlace on/off (cadence experiment)\n");
     printf("\n");
     printf("  Pin map (change in main/msp3520.h):\n");
     printf("    SCK->GPIO%d  MOSI->GPIO%d  MISO->GPIO%d  CS->GPIO%d\n",

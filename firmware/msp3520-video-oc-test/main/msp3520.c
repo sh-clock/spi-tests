@@ -385,6 +385,29 @@ esp_err_t msp3520_prepare_stream(void)
     return lcd_cmd(0x2B, paset, 4);
 }
 
+esp_err_t msp3520_prepare_half_stream(int half)
+{
+    /* Half-width window for column-interlaced fields. MV=1 (LCD_MADCTL)
+     * makes CASET span the 480-px display axis, so a "half" is a 240-px
+     * column band; PASET stays full height. Every RAMWR after this starts
+     * at the half-window origin (datasheet §5.2.24: the column and page
+     * registers reset to SC/SP), and rows wrap inside the window exactly
+     * like the full-window case (§6.3). */
+    static const uint8_t caset[2][4] = {
+        { 0, 0,               0, (LCD_H_RES / 2) - 1 },               /* x 0..239   */
+        { 0, LCD_H_RES / 2,   (LCD_H_RES - 1) >> 8, (LCD_H_RES - 1) & 0xFF }, /* 240..479 */
+    };
+    const uint8_t paset[4] = { 0, 0, (LCD_V_RES - 1) >> 8, (LCD_V_RES - 1) & 0xFF };
+    if (half != 0 && half != 1) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    esp_err_t err = lcd_cmd(0x2A, caset[half], 4);
+    if (err != ESP_OK) {
+        return err;
+    }
+    return lcd_cmd(0x2B, paset, 4);
+}
+
 esp_err_t msp3520_field_begin(void)
 {
     /* CS low + RAMWR: opens a frame write. The address pointer resets to
@@ -403,6 +426,16 @@ esp_err_t msp3520_queue_block(const uint8_t *block_bytes)
      * — 1 RAMWR + 20 blocks per frame instead of 4 transactions per line. */
     return lcd_queue(block_bytes,
                      (size_t)LCD_BLOCK_LINES * LCD_H_RES * (size_t)s_wire_bpp,
+                     true);
+}
+
+esp_err_t msp3520_queue_half_block(const uint8_t *block_bytes)
+{
+    /* like msp3520_queue_block, but for a 240-px half window: 16 lines of
+     * LCD_H_RES/2 pixels. The half window wraps rows exactly like the full
+     * window, so blocks are back-to-back data transactions again. */
+    return lcd_queue(block_bytes,
+                     (size_t)LCD_BLOCK_LINES * (LCD_H_RES / 2) * (size_t)s_wire_bpp,
                      true);
 }
 

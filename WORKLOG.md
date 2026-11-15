@@ -129,6 +129,8 @@ Reliable SPI clock per owner's sweep: "60 MHz" requested — see §2.1 (this is 
 - [x] Pixel audit + binary byte-audit + package + push.
 - [ ] Owner hardware test: expect ~10.5 fps @ 40 MHz actual, no combing.
 - [ ] Optional last $0 experiments for 80 MHz (§6) — low expectation.
+- [x] v5 (2026-11-15): interlacing challenge answered (§14), column-
+      interlace A/B mode built ('i' key), README de-staled, pushed.
 
 ## 6. Roadmap
 
@@ -262,3 +264,74 @@ All claims below carry source URLs in the session record; headline verdicts:
   SCK, <100 mm wires) this is the complete remaining $0 experiment space
   for 80 MHz. If none of it works, the module is definitively at its
   ceiling (~10.5 fps) and 15 fps requires different hardware (§12.4).
+
+## 14. v5 (2026-11-15) — the interlacing challenge, answered + column-interlace A/B
+
+The owner challenged §10's "interlacing adds no fps": "isn't it literally
+the whole point of the technology to push less bandwidth over?" Four
+parallel research agents (broadcast/display theory, GRAM-panel prior art,
+datasheet mechanics, motion perception). Verdict — both sides are right
+about different things:
+
+1. **The owner is right about what interlacing is FOR.** It halves the
+   bytes per FIELD (230,400 vs 460,800) → doubles the field/update rate
+   (21.7/s at 40 MHz). That is exactly the 1934 Mertz & Gray broadcast
+   trade (spatial-for-temporal at fixed bandwidth).
+2. **It has never halved the bytes per PICTURE.** Every interlaced system
+   carried 25/30 unique pictures/s at 50/60 fields/s. The temporal gain
+   existed only for FIELD-NATIVE sources (50i/60i cameras); for
+   progressive sources in an interlaced carrier (PsF/telecine) the
+   literature is explicit: zero new motion information. Our source is
+   15 fps progressive → the PsF case.
+3. **Per-pixel update rate under interlacing = field_rate/2 = 10.85 Hz**,
+   identical to v4 progressive. On a hold-type GRAM panel there is no
+   luminance modulation at 21.7 Hz for the eye to fuse — the CRT trick
+   (phosphor decay + eye integration) does not transfer.
+4. **Row-interlace on GRAM SPI panels IS established prior art** —
+   juj/fbcp-ili9341 ships it adaptively ("This effectively doubles the
+   maximum display update rate"; on ILI9486-class "the rule rather than
+   the exception... works much smoother when applying throttling");
+   rickyzhang82 ESP32+ILI9341 NES interlace; MstfOztrk scanline GIF
+   player. ZERO instances of column interlace found anywhere. Note juj's
+   source is a ~60 fps Pi framebuffer (field-native case) — not ours.
+5. **Perception (moderate confidence, ~65–70%, no direct study of
+   two-block staggering):** a REGULAR ~46 ms update cadence may beat
+   irregular full-frame steps — 10.85 Hz sits at the 10–12 Hz discrete-
+   event visibility floor, and the telecine literature says irregular
+   hold times are the primary judder driver, worst on slow pans.
+   Content-dependent → hence an A/B toggle, not a default change.
+6. **Datasheet mechanics all CONFIRMED** (agent-quoted): §5.2.24 every
+   RAMWR resets the write pointer to the window origin; §4.3/4.3.1 CS
+   release between whole bytes = legal pause, new command after = fine;
+   §6.3 rows wrap inside any window; under MADCTL 0x28 (MV=1) CASET spans
+   the 480-px display axis; NO stride/skip mechanism exists (so v1–v3 row
+   interlace inherently needed 160 single-row windows per field — the
+   reason it cost ~2 fps).
+
+**v5 implementation** ('i' hotkey; progressive stays the default):
+- Column halves are CONTIGUOUS windows (CASET 0..239 / 240..479 × PASET
+  0..319) → v4-style block streaming per half: ~21 upd/s at 40 MHz (v3
+  row interlace managed 17 fields/s), and combing becomes one stationary
+  mid-screen seam (shear only during motion).
+- The decoder is forward-only → push_ilace_frame() decodes each frame
+  ONCE into a 460,800 B PSRAM stage (CPU-only reads; DMA still reads the
+  internal s_block rows, which double as the 11,520 B half-block staging
+  buffers) and slices both halves from it. Decode is NOT overlapped
+  (~3–8 ms/frame serialized → a few % below theory; ping-pong staging is
+  the natural v5.1 follow-up if the A/B favors the concept).
+- Mode-toggle safe: the window is re-asserted on every progressive frame
+  (push_frame now calls prepare_stream itself); fps counter stays
+  frame-based (comparable with v4 numbers), upd/s shown alongside.
+- Byte audit extended: the half-window CASET table (00 00 00 EF 00 F0
+  01 DF) and the "ynrqdi" key string must each appear exactly once.
+
+**Incidents this round:**
+- FIFTH sandbox recycle: stale v2-era tree restored locally (row-interlace
+  code, MADCTL 0x48!) + repo clone, ESP-IDF and setup scripts wiped. The
+  §11 re-verify procedure caught it immediately (grep for {0x28} found 0
+  → traced to LCD_MADCTL macro, binary audit confirmed 0x28 — genuine;
+  the staleness was in the RESTORED LOCAL tree, discarded and re-cloned).
+- The project README was still the v2-era interlace document (never
+  updated for v4 — "combing is normal", 5.4 MB blob, queue_line API) and
+  the firmware banner still said "interlaced VIDEO player". Both likely
+  fed the interlacing confusion. README rewritten for v5; banner fixed.

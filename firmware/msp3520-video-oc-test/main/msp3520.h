@@ -26,6 +26,9 @@
  *      msp3520_queue_block(px)     queue 16 lines of pixel data (one DMA tx)
  *      msp3520_retire_block()      wait until the oldest queued block is done
  *      msp3520_field_end()         CS high
+ *    v5 column-interlace adds:
+ *      msp3520_prepare_half_stream(h)  set a 240-px half window (h=0 left)
+ *      msp3520_queue_half_block(px)    queue 16 half-window lines (one DMA tx)
  *    Keeping two blocks "in flight" lets the CPU decode the next block
  *    while DMA is still pushing the previous one.
  */
@@ -114,6 +117,25 @@ esp_err_t msp3520_fill_screen(uint16_t color565);
  * streamed as pure pixel data — the controller wraps rows inside the window,
  * so no per-line PASET/RAMWR addressing is needed on the wire. */
 esp_err_t msp3520_prepare_stream(void);
+
+/* --- v5: column-interlaced half-frame streaming --------------------------- */
+
+/* Set the address window to ONE 240-px half of the display (half=0: x 0..239,
+ * half=1: x 240..479), full height. With MADCTL MV=1 CASET spans the 480-px
+ * display axis, so a "half" is a vertical column band. A half-frame then
+ * streams exactly like a full frame: msp3520_field_begin() (RAMWR resets the
+ * write pointer to the half-window origin, datasheet §5.2.24) + 20
+ * msp3520_queue_half_block() calls + msp3520_field_end(). */
+esp_err_t msp3520_prepare_half_stream(int half);
+
+/* Queue one block of LCD_BLOCK_LINES consecutive half-window lines
+ * (LCD_BLOCK_LINES * LCD_H_RES/2 * wire_bpp bytes) as one DMA transaction.
+ * Same in-flight/retire rules as msp3520_queue_block(). */
+esp_err_t msp3520_queue_half_block(const uint8_t *block_bytes);
+
+/* Geometry of one half-frame (for player-side buffers). */
+#define LCD_HALF_LINE_BYTES  ((LCD_H_RES / 2) * 3)                  /* 720  */
+#define LCD_HALF_BLOCK_BYTES (LCD_HALF_LINE_BYTES * LCD_BLOCK_LINES) /* 11520 */
 
 /* CS low + RAMWR: opens a frame write; the address pointer resets to the
  * window start (row 0) and keeps advancing while CS stays low. */
