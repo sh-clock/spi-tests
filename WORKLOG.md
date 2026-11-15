@@ -617,3 +617,71 @@ N>2 threading only becomes sane on the P4/DSI board where every region
 can hold >= 15-20 Hz. The RIGHT steroids on S3/SPI is what v7 now does:
 spend the fixed 21.7 Hz grid on what actually changed (content-adaptive
 temporal weaving), rather than statically slicing the screen N ways.
+## 18. (2026-11-15) The "1-bit I80" clock claim vs the S3 silicon
+
+Owner question: a web-sourced (Google AI) suggestion claimed the
+LCD_CAM peripheral in "1-bit I80 mode" could drive the SPI-wired
+MSP3520 at 53.33 MHz (PLL_F160M/3) or 60 MHz (PLL_D2/4) on the existing
+pins 9-14. Is it accurate, and are clocks between 40 and 80 MHz
+possible at all? "If it is accurate, test it."
+
+**Verdict per claim (all verified against the IDF v6.1 source that this
+firmware is built with):**
+
+1. "1-bit I80 mode" — DOES NOT EXIST. esp_lcd_new_i80_bus() accepts
+   only bus_width 8 or 16 and rejects everything else
+   (components/esp_lcd/i80/esp_lcd_panel_io_i80.c:129, comment:
+   "LCD_CAM can support up to 24 data lines, we restrict users to only
+   use 8 or 16 bit width"). Demonstrated at runtime: bus_width=1 and 2
+   both return ESP_ERR_INVALID_ARG ("invalid bus width:1").
+2. "WR=SCLK, D0=MOSI, CS/DC identical" — only meaningful if (1) were
+   true; it is not. There is no serial LCD mode in the S3 LCD_CAM.
+3. The clock arithmetic — WOULD be correct if (1) existed: LCD_CAM
+   sources are PLL_F160M (160 MHz) and PLL_D2 (240 MHz)
+   (soc/clk_tree_defs.h: LCD_CLK_SRC_PLL160M/PLL240M), and pclk =
+   source / integer prescale 1..64 (lcd_ll.h, LCD_LL_PCLK_DIV_MAX=64),
+   so 160/3 = 53.33 and 240/4 = 60 are real LCD_CAM clocks. The
+   claimed enum names are slightly off (LCD_CLK_SRC_PLL160M exists;
+   "LCD_CLK_SRC_PLL_D2" is actually LCD_CLK_SRC_PLL240M), and the
+   snippet's bus config fields (psram_trans_align/sram_trans_align)
+   do not exist in v6.1.
+4. reverse_color_bits — REAL (esp_lcd_io_i80.h:85), as Google hedged.
+5. "GPIO drive cap 0/1 + GND twist" — matches our own WORKLOG §13
+   findings; that part was never in dispute.
+
+**The actual question — clocks between 40 and 80 MHz on the GPSPI:
+none exist, and none can be made.** The S3 SPI clock register is
+`SCK = source / ((clkdiv_pre+1) * (clkcnt_n+1))` with integer divisors
+only (spi_struct.h:58 documents exactly this), clkcnt_h/clkcnt_l set
+the DUTY CYCLE only (spi_ll.h: spi_ll_freq_for_pre_n = fapb/(pre*n);
+h = (duty*n+127)/256), requests above 3/4 of the source (> 60 MHz)
+take the clk_equ_sysclk bypass (exactly 80), and the GPSPI's only
+clock sources are APB (80 MHz) and XTAL (soc/clk_tree_defs.h) — the
+160/240 MHz LCD PLLs are not SPI sources. The lattice is
+{80, 40, 26.67, 20, 16, ...}. This also fully explains the project's
+measured "35-60 requests run at 40, 65-80 at 80" from the v1-v6 sweeps
+(now with the exact mechanism: requests <= 60 use the divider (best
+integer divisor match), > 60 bypass to 80).
+
+**Tested** (as requested): new firmware `msp3520-clock-probe` —
+- Phase 1: asks the driver itself (spi_device_get_actual_freq) for a
+  request sweep. Verified in QEMU (full table): 10->10.0, 15->16.0,
+  20->20.0, 25/30->26.67, 35..60->40.0 (including 53.33->40 and
+  60.000->40), 60.001..80->80.0. Plus the live i80 bus_width=1/2
+  rejections.
+- Phase 2 (needs real DMA, so hardware-only): applies each clock with
+  a 1-byte transfer, dumps the live SPI2 clock register, and measures
+  the actual bus clock by timing 10 x 16 KiB dummy transfers.
+  Panel-safe: CS/DC/RST held high, the ILI9488 ignores everything.
+- Bonus finding: this also located the QEMU stall from §17 — the
+  probe boots, initializes the bus, adds devices and runs the i80
+  checks in QEMU, then hangs on the FIRST SPI polling transaction.
+  So the v6/v7 QEMU stall is the emulator's GPSPI DMA model, not our
+  firmware's boot path.
+
+Deliverables: download/msp3520-clock-probe/ (source, README) +
+msp3520-clock-probe-firmware/ (flashable bundle + instructions), both
+pushed. Bottom line for the project: 40 MHz remains the top sane clock
+on this wiring; 80 MHz remains the only step above it (4x the panel's
+spec, needs the §13 wiring levers). The 53.3/60 MHz dream dies here —
+not on wiring or drive strength, but in the S3's clock tree.

@@ -1,0 +1,50 @@
+MSP3520 SPI clock probe - flashable firmware
+============================================
+ESP32-S3 (esp32s3) - ESP-IDF v6.1.0 - built 2026-11-15
+Default partition table, tiny app (221 KB), 8 MB flash setting
+(DevKitC-1 N8 / N8R2 / N16 all work).
+
+WHAT THIS IS
+  A one-shot diagnostic that answers, on your actual board:
+  1. Which SPI clocks the ESP32-S3 GPSPI can actually produce
+     (the driver's own answer via spi_device_get_actual_freq), and
+  2. whether a "1-bit I80 LCD_CAM mode" exists (it does not - the
+     probe calls esp_lcd_new_i80_bus(bus_width=1) and prints the
+     ESP_ERR_INVALID_ARG rejection).
+  It also measures the real bus clock by timing dummy 16 KiB
+  transfers, and dumps the live SPI2 clock register.
+
+  SAFE WITH THE DISPLAY WIRED AND POWERED: the probe holds CS/DC/RST
+  high, so the ILI9488 ignores every clock wiggle. Nothing on the
+  screen changes; when done, re-flash a video firmware to get the
+  display back.
+
+  Already verified in emulation (QEMU): phase 1 prints
+    request 10 -> 10.0, 15 -> 16.0, 20 -> 20.0, 25/30 -> 26.67,
+    35..60 -> 40.0, 60.001..80 -> 80.0
+  and the i80 rejections. On hardware you additionally get the
+  measured-throughput column (phase 2 needs real DMA, which the
+  emulator does not model - that is why phase 2 only completes on
+  the real chip).
+
+FILES
+  bootloader.bin              flash at 0x0
+  partition-table.bin         flash at 0x8000
+  msp3520_clock_probe.bin     flash at 0x10000
+  msp3520_clock_probe_full.bin all three merged - flash at 0x0 (easiest)
+
+FLASH IT (pick your COM port):
+  C:\Espressif\tools\python\v6.1\venv\Scripts\python.exe -m esptool --chip esp32s3 -p COM10 -b 460800 --before default-reset --after hard-reset write-flash 0x0 msp3520_clock_probe_full.bin
+  (flashing takes seconds - no video embedded)
+
+WHAT YOU SHOULD SEE (console, either USB port, 115200):
+  === MSP3520 SPI clock probe (ESP32-S3, IDF v6.1) ===
+  ... phase 1 table (request vs the driver's actual clock) ...
+  esp_lcd_new_i80_bus(bus_width=1) -> ESP_ERR_INVALID_ARG
+  ... phase 2 table (live register + measured MHz) ...
+  === VERDICT ... ===
+  probe complete - safe to power off.
+
+WIRING (unchanged - it only reads SCK/MOSI pins 11/12 and holds
+CS/DC/RST/BL): CS GPIO10, DC GPIO9, RESET GPIO14, MOSI GPIO11,
+SCK GPIO12, backlight GPIO47.
