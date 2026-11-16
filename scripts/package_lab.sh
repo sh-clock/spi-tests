@@ -34,6 +34,7 @@ cp -r "$LAB/main" "$LAB/tools" "$SRC/"
 rm -rf "$SRC/main"/*.o
 # strip editor/OS noise if any
 find "$SRC" -name '.DS_Store' -delete 2>/dev/null || true
+find "$SRC" -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true
 
 # --- firmware package ---
 cp "$BOOT" "$FW/bootloader.bin"
