@@ -2,7 +2,7 @@ skills/
 node_modules/
 .idf/
 download/
-.idf/
+.idf_setup*.log
 scripts/__pycache__/
 firmware/msp3520-video-lab/tools/__pycache__/
 firmware/msp3520-video-lab/sdkconfig

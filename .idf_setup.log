@@ -1,14 +1,0 @@
-=== idf_setup: python/cmake/ninja ===
-Python 3.12.16
-cmake version 4.4.5
-1.13.2.git.kitware.jobserver-pipe-1
-=== idf_setup: cloning esp-idf v6.1 (shallow) ===
-
-Updating files:  60% (12606/20751)Updating files:  61% (12659/20751)Updating files:  62% (12866/20751)Updating files:  63% (13074/20751)Updating files:  64% (13281/20751)Updating files:  65% (13489/20751)Updating files:  66% (13696/20751)Updating files:  67% (13904/20751)Updating files:  68% (14111/20751)Updating files:  69% (14319/20751)Updating files:  70% (14526/20751)Updating files:  71% (14734/20751)Updating files:  72% (14941/20751)Updating files:  73% (15149/20751)Updating files:  74% (15356/20751)Updating files:  75% (15564/20751)Updating files:  76% (15771/20751)Updating files:  77% (15979/20751)Updating files:  78% (16186/20751)Updating files:  79% (16394/20751)Updating files:  80% (16601/20751)Updating files:  81% (16809/20751)Updating files:  82% (17016/20751)Updating files:  83% (17224/20751)Updating files:  84% (17431/20751)Updating files:  85% (17639/20751)Updating files:  86% (17846/20751)Updating files:  87% (18054/20751)Updating files:  88% (18261/20751)Updating files:  89% (18469/20751)Updating files:  90% (18676/20751)Updating files:  91% (18884/20751)Updating files:  92% (19091/20751)Updating files:  93% (19299/20751)Updating files:  94% (19506/20751)Updating files:  95% (19714/20751)Updating files:  96% (19921/20751)Updating files:  97% (20129/20751)Updating files:  98% (20336/20751)Updating files:  99% (20544/20751)Updating files: 100% (20751/20751)Updating files: 100% (20751/20751), done.
-=== idf_setup: install.sh esp32s3 ===
-  - /home/z/my-project/.idf/v6.1/esp-idf/tools/requirements/requirements.core.txt
-All done! You can now run:
-
-  . ./export.sh
-
-=== idf_setup: DONE ===

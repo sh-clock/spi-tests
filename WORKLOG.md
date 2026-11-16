@@ -889,3 +889,43 @@ NOT fit on 8 MB flash: full 29.97 fps (17.9-22.1 MB depending on
 dither) or a library of clips (~5.6 MB/min at this quality). When the
 SD reader does get wired, the same VLB2 decoder streams from a file
 unchanged — only the blob source (flash mmap -> FATFS read) moves.
+
+## 21. (2026-11-16) Post-recycle recovery: reflash needed, not rework
+
+Owner reported "the current one only has less than 3 secs of footage"
+after the WORKLOG 20 delivery. Diagnosis: the repo state was correct
+(base.vlb2 = 122 frames, 6,735,381 B — verified by header parse and
+verify_assets.py), but the board was still running the WORKLOG 19
+build (20 frames @ 10 fps = 2.0 s loop) — the full-clip package had
+never been flashed. No code or asset work was needed.
+
+Environment recovery (sandbox recycled again — 8th time):
+- .idf/ toolchain, firmware build/, download/ all wiped; re-ran
+  scripts/idf_setup.sh (ESP-IDF v6.1 clone + esp32s3 tools, ~10 min).
+- Git divergence: the owner had manually uploaded INTRO.mkv to
+  assets/ via the GitHub web UI (6e5ea18 "Add files via upload",
+  sha256-identical to upload/INTRO.mkv). Local main rebased onto it
+  and pushed as 96cc9fc. .gitignore now excludes .idf_setup*.log
+  (the previous session's auto-commit had tracked the setup log).
+
+Verification re-run (nothing trusted from memory):
+- verify_assets.py: ALL CHECKS PASSED (122/122 frames decode, mbmap
+  bit-exact, merge2 recomputed, budget 6,810,845 / 7,650,000 B).
+- host_test_labvid.py: HOST GATE PASSED (device labvid.c compiled
+  unmodified with gcc, 122/122 per-frame hashes match the Python
+  mirror, combined hash eda25db4).
+- Clean rebuild: app 7,044,256 B (byte-identical size to the WORKLOG
+  20 build), embedded VLB2 header at 0xBA24 reads 480x320, 122
+  frames. Driver audit at source level: LCD_MADCTL 0x28, init-table
+  COLMOD 0x66, LCD_BPP 3. (Raw binary byte-pattern counts are
+  meaningless on a 7 MB compressed image — the 0x55/0x36 hits were
+  coincidental matches inside video data; audited the source instead.)
+- Packages regenerated: download/msp3520-video-lab/ (cleaned source)
+  + msp3520-video-lab-firmware/ (bootloader, partition table, 7.04 MB
+  app, 7.11 MB merged full image) + both zips. Zero __pycache__.
+
+Action for the owner: flash msp3520_video_lab_full.bin (the merged
+image) at 0x0 — see FLASH-INSTRUCTIONS.txt in the firmware package.
+Every technique then plays the full 12.2 s clip in a loop; the <3 s
+loop disappears. 84% of the factory partition used; 29.97 fps full
+rate still does not fit (that needs SD, per §20).
