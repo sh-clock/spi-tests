@@ -1,40 +1,52 @@
 #!/usr/bin/env python3
 """encode_lab.py — build the msp3520-video-lab flash assets from INTRO.mkv.
 
-The lab firmware tests 15+ playback "techniques" (row interlacing, scanlines,
-column interlace, quincunx, delta updates, pixel doubling, indexed colour,
-pre-interlaced packing, dual-core pipelining). They all play the SAME cut of
-the source so artifacts are comparable. This script:
+FULL-CLIP edition (v2). The lab used to bake a 20-frame cut as raw
+indexed frames (base.idx, 153.6 KB/frame) plus four derived assets
+(pre_i4/half/third/delta.spans). This edition stores the WHOLE 12.045 s
+clip as ONE compressed base asset and derives everything else at runtime:
 
-  1. desqueezes the anamorphic DVD frame (SAR 8:9 -> 640x480 square pixels),
-     detects and crops the 16:9 letterbox bars, center-crops to 3:2 and
-     scales to the panel's 480x320 (pan-and-scan, no geometry distortion —
-     motion artifacts must stay honest);
-  2. auto-places the cut at the calm->burst motion transition (so the delta
-     techniques show both regimes);
-  3. builds ONE global 256-colour palette in RGB666 space (median cut) —
-     the palette bytes ARE the ILI9488 wire bytes, so the firmware expands
-     one index to 3 wire bytes with a 768-byte LUT;
-  4. encodes frames as 8-bit indices with 2x2 Bayer ordered dithering
-     (technique 12's "256-colour + Bayer" look, shared by all techniques);
-  5. writes, into ../main/:
-       base.idx    480x320 frames, row-major u8 indices (random row access)
-       pre_i4.idx  same frames reordered field-major for 4:1 interlace
-                   (technique 13: every stored field is exactly what is sent)
-       half.idx    240x320 frames (2x horizontal doubling source, tech 11a)
-       third.idx   160x320 frames (3x horizontal doubling source, tech 11b)
-       delta.spans per-row changed-pixel spans vs previous frame (tech 9)
+  1. desqueeze the anamorphic DVD frame (SAR 8:9 -> 640x480), detect and
+     crop the 16:9 letterbox bars, center-crop to 3:2 and scale to the
+     panel's 480x320 (pan-and-scan, no geometry distortion);
+  2. sample at 10 fps (measured: the wire shows ~10.5 full frames/s at
+     40 MHz, so 10 fps plays essentially real-time; full 29.97 fps would
+     need ~22 MB — see WORKLOG 20);
+  3. ONE global 256-colour palette in RGB666 space (median cut over the
+     whole clip) — the palette bytes ARE the ILI9488 wire bytes, so the
+     firmware expands one index to 3 wire bytes with a 768-byte LUT;
+  4. encode frames as 8-bit indices with 2x2 Bayer ordered dithering
+     (the established lab look), 3x3 median pre-filter (kills MPEG-2
+     noise so static areas are bit-identical — the delta techniques
+     depend on this);
+  5. compress every frame INDEPENDENTLY (RLE runs, then the v6/v7 LZSS
+     with a 32 KiB window — must stay <= LABVID_RING_SIZE in labvid.h)
+     so any frame is reachable in any order;
+  6. write, into ../main/:
+       base.vlb2   "VLB2" u16 w u16 h u16 frames
+                    u32 offset[frames+1]  (start of each frame's stream)
+                    per frame: RLE rows (runs of [count-1][index], counts
+                    summing to w) compressed with LZSS
        palette.pal 256 x 3 wire RGB666 bytes (the LUT)
-     every .idx/.spans file carries a small header the firmware parses.
+       merge2.bin  64 KiB index-merge LUT: merge2[(a<<8)|b] = palette
+                   index nearest to the average of colours a and b (the
+                   pixel-doubling techniques decimate the staged 480-wide
+                   frame through it; 3:1 is two LUT steps)
+       mbmap.bin   "VLM1" u16 bw u16 bh u16 frames + per frame 75 B of
+                   16x16 macroblock dirty bits (block differs from the
+                   previous frame; frame 0 all-dirty)
 
-Frame caps are chosen to fit the 8 MB flash next to ~1.1 MB of app code
-(factory partition 0x7F0000). The script prints a size report and fails if
-the total exceeds the budget.
+Every frame is round-trip verified in-script (LZSS decode == RLE stream,
+RLE expansion == the quantized frame), and the whole blob is re-read from
+disk and re-decoded before the size report. The script FAILS if the total
+asset size exceeds the budget (8 MB factory partition minus app code).
 """
 import subprocess
 import sys
-import numpy as np
+import time
 from pathlib import Path
+
+import numpy as np
 from scipy.ndimage import median_filter
 
 SRC = "/home/z/my-project/upload/INTRO.mkv"
@@ -44,20 +56,13 @@ OUT = Path(__file__).resolve().parent.parent / "main"
 PANEL_W, PANEL_H = 480, 320
 DESQ_W, DESQ_H = 640, 480          # square-pixel 4:3 frame
 
-# ---- cut / asset caps ----
-SCAN_T0 = 7.5                        # motion scan starts here (seconds)
-SCAN_FRAMES = 60                     # 2 s of scan frames
-BASE_FRAMES = 20                     # 480x320 indexed frames
-PREI4_FRAMES = 6                     # field-major 4:1 pack
-HALF_FRAMES = 12                     # 240-wide
-THIRD_FRAMES = 12                    # 160-wide
-DELTA_FRAMES = 12                    # spans (greedily fit to the budget)
-BUDGET_ASSETS = 6_600_000            # bytes for all assets together
-CALM_LEAD = 6                        # frames of calm before the burst
+# ---- bake config ----
+FPS_BAKE = 10                      # 10 fps sampling of the 29.97 source
+DITHER_AMP = 4.0                   # /255, one RGB666 step
+LZ_WIN = 32768                     # <= LABVID_RING_SIZE (32 KiB) in labvid.h
+BUDGET_ASSETS = 7_650_000          # bytes for all assets together
 
 BAYER2 = np.array([[0, 2], [3, 1]], dtype=np.float32) / 4.0   # 2x2, mean 0.5
-DITHER_AMP = 4.0                     # /255, one RGB666 step
-SPAN_COLOR_TOL = 10.0                # /255 per channel, see write_spans
 
 
 def ffmpeg_raw(args):
@@ -65,7 +70,7 @@ def ffmpeg_raw(args):
                           capture_output=True, check=True).stdout
 
 
-def grab_frame(t, vf, w=PANEL_W, h=PANEL_H):
+def grab_frame(t, vf, w, h):
     raw = ffmpeg_raw(["-ss", f"{t}", "-i", SRC, "-frames:v", "1",
                       "-vf", vf, "-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
     return np.frombuffer(raw, np.uint8).reshape(h, w, 3)
@@ -81,31 +86,13 @@ def detect_crop():
     h = DESQ_H - top - bot
     print(f"letterbox: top {top}px, bottom {bot}px -> active {h}px "
           f"({'16:9' if abs(h - 360) < 12 else 'unexpected — using measured'})")
-    # center-crop the active area to 3:2 (540 x h'), then scale to panel
+    # center-crop the active area to 3:2, then scale to panel
     w3x2 = (h * 3) // 2
     if w3x2 > DESQ_W:
         w3x2 = DESQ_W
     cc = (DESQ_W - w3x2) // 2
     return (f"{desq},crop={w3x2}:{h}:{cc}:{top},"
             f"scale={PANEL_W}:{PANEL_H}")
-
-
-def motion_scan(vf):
-    """Grab SCAN_FRAMES, return them + the index of the biggest jump."""
-    t0 = SCAN_T0
-    raw = ffmpeg_raw(["-ss", f"{t0}", "-i", SRC, "-frames:v", str(SCAN_FRAMES),
-                      "-vf", vf, "-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
-    n = len(raw) // (PANEL_W * PANEL_H * 3)
-    if n < SCAN_FRAMES:
-        print(f"warning: only {n} scan frames")
-    frames = (np.frombuffer(raw, np.uint8)
-              .reshape(n, PANEL_H, PANEL_W, 3).astype(np.float32))
-    d = np.abs(np.diff(frames, axis=0)).mean(axis=(1, 2, 3))
-    burst = int(np.argmax(d))
-    print(f"scan: {n} frames from t={t0}s; biggest jump at frame {burst} "
-          f"(t={t0 + burst / 29.97:.2f}s, mean|d|={d[burst]:.1f})")
-    start = max(0, burst - CALM_LEAD)
-    return frames, start
 
 
 # ---------------- palette (median cut in RGB666 space) ----------------
@@ -175,155 +162,382 @@ def quantize_with_dither(frame_f32, pal_f32, cache):
     return out
 
 
-def downsample_w(frame, factor):
-    """(H,W,3) -> (H,W//factor,3) box filter."""
-    h, w, _ = frame.shape
-    w2 = w // factor
-    return frame[:, : w2 * factor, :].reshape(h, w2, factor, 3).mean(axis=2)
+# ---------------- RLE + LZSS (the v6/v7 codec, 1-byte payload) ---------
+
+def rle_frame(fr):
+    """(H,W) u8 indices -> RLE bytes: per row, runs of [count-1][index],
+    counts sum to W (the firmware decoder's exact format)."""
+    out = bytearray()
+    for row in fr:
+        brk = np.flatnonzero(np.diff(row)) + 1
+        starts = np.concatenate(([0], brk))
+        ends = np.concatenate((brk, [len(row)]))
+        for s, e in zip(starts, ends):
+            L = e - s
+            while L > 0:
+                c = min(L, 256)
+                out += bytes((c - 1, row[s]))
+                L -= c
+    return bytes(out)
 
 
-# ---------------- asset writers ----------------
+def rle_expand_rows(stream, h, w):
+    """Mirror of the firmware RLE layer (labvid.c lz_row): expand a whole
+    frame, validating that every row's counts sum to exactly w."""
+    out = bytearray()
+    cur = 0
+    for _ in range(h):
+        px = 0
+        while px < w:
+            if cur + 2 > len(stream):
+                raise AssertionError("RLE stream truncated")
+            cb, idx = stream[cur], stream[cur + 1]
+            cur += 2
+            take = min(cb + 1, w - px)
+            out += bytes((idx,)) * take
+            px += take
+        if px != w:
+            raise AssertionError("RLE row overrun")
+    if cur != len(stream):
+        raise AssertionError("RLE stream has trailing bytes")
+    return bytes(out)
 
-def write_idx(path, magic, w, h, frames_u8):
-    frames = np.asarray(frames_u8, np.uint8)
-    hdr = magic + w.to_bytes(2, "little") + h.to_bytes(2, "little") \
-        + len(frames).to_bytes(2, "little")
-    path.write_bytes(hdr + frames.tobytes())
-    return len(hdr) + frames.nbytes
 
+def lzss_encode(data, win=LZ_WIN, chain=24, store=48):
+    """The v6/v7 LZSS encoder (tools/convert_video.py), parameterised
+    window: literal = 1 byte; match = 3 bytes (off-1 BE16, len-4), one
+    flag byte per 8 tokens; offsets never exceed `win`."""
+    n = len(data)
+    out = bytearray()
+    head = {}
+    i = 0
+    tokens = []
 
-def write_pre_i4(path, base_frames):
-    """field-major reorder: frame f, phase p -> rows {p, p+4, ...}."""
-    fields = []
-    for f in base_frames:
-        for p in range(4):
-            fields.append(f[p::4, :])          # (80, 480)
-    data = np.asarray(fields, np.uint8)
-    hdr = b"VLP1" + (480).to_bytes(2, "little") + (320).to_bytes(2, "little") \
-        + len(base_frames).to_bytes(2, "little") + (4).to_bytes(2, "little")
-    path.write_bytes(hdr + data.tobytes())
-    return len(hdr) + data.nbytes
-
-
-def write_spans(path, base_frames, pal, budget=None):
-    """per frame: for each of 320 rows: u8 nspans, then spans
-    (u16 x0, u16 len, len index bytes). A pixel is sent when its palette
-    COLOUR differs from the DECODER'S CANVAS (not the previous frame!) by
-    more than SPAN_COLOR_TOL per channel — comparing against the canvas
-    keeps the drift bounded to the tolerance forever (per-frame comparison
-    would let consecutive sub-tolerance changes accumulate). Frame 0 is
-    full rows. Heavily fragmented rows (> 32 spans or > 92% coverage) are
-    stored as ONE full-row span. Frames are included greedily until the
-    budget is exhausted."""
-    per_frame = []
-    pal_i = pal.astype(np.int16)
-    canvas = None
-    for fr in base_frames:
-        out = bytearray()
-        first = canvas is None
-        if first:
-            canvas = fr.copy()          # decoder canvas after the full field
-        for y in range(PANEL_H):
-            row = fr[y]
-            if first:
-                spans = [(0, PANEL_W)]  # frame 0 defines the canvas
+    def insert(pos):
+        if pos + 3 <= n:
+            key = data[pos] << 16 | data[pos + 1] << 8 | data[pos + 2]
+            lst = head.get(key)
+            if lst is None:
+                head[key] = [pos]
             else:
-                d = np.abs(pal_i[row] - pal_i[canvas[y]]).max(axis=1)
-                diff = np.flatnonzero(d > SPAN_COLOR_TOL)
-                if len(diff) == 0:
-                    spans = []
-                else:
-                    brk = np.flatnonzero(np.diff(diff) > 1)
-                    starts = np.concatenate([[diff[0]], diff[brk + 1]])
-                    ends = np.concatenate([diff[brk], [diff[-1]]])
-                    spans = [(int(s), int(e - s + 1)) for s, e in zip(starts, ends)]
-                    if len(spans) > 32 or len(diff) > 0.92 * PANEL_W:
-                        spans = [(0, PANEL_W)]
-            out.append(len(spans))
-            for x0, ln in spans:
-                out += x0.to_bytes(2, "little") + ln.to_bytes(2, "little")
-                out += row[x0:x0 + ln].tobytes()
-                canvas[y, x0:x0 + ln] = row[x0:x0 + ln]
-        per_frame.append(bytes(out))
+                lst.append(pos)
+                if len(lst) > store:
+                    del lst[:store // 2]
 
-    # greedy frame inclusion within the budget (keep >= 6 or fail)
-    hdr = bytearray(b"VLD1" + (480).to_bytes(2, "little")
-                    + (320).to_bytes(2, "little"))
-    keep = len(per_frame)
-    if budget is not None:
-        while keep > 6 and 10 + sum(len(p) for p in per_frame[:keep]) > budget:
-            keep -= 1
-    hdr += keep.to_bytes(2, "little")
-    blob = bytes(hdr) + b"".join(per_frame[:keep])
-    path.write_bytes(blob)
-    sizes = [len(p) for p in per_frame[:keep]]
-    print(f"delta.spans: kept {keep} frames, sizes "
-          f"{[f'{s//1024}K' for s in sizes]}")
-    return len(blob)
+    def best_match(pos):
+        if pos + 3 > n:
+            return 0, 0
+        key = data[pos] << 16 | data[pos + 1] << 8 | data[pos + 2]
+        lst = head.get(key)
+        if not lst:
+            return 0, 0
+        best_len = 0
+        best_off = 0
+        limit = pos - win
+        cnt = 0
+        maxl = min(259, n - pos)
+        for p in reversed(lst):
+            if p < limit:
+                break
+            cnt += 1
+            if cnt > chain:
+                break
+            if best_len and data[p + best_len] != data[pos + best_len]:
+                continue
+            l = 0
+            while l < maxl and data[p + l] == data[pos + l]:
+                l += 1
+            if l > best_len:
+                best_len, best_off = l, pos - p
+                if l >= maxl:
+                    break
+        if best_len >= 5:
+            return best_len, best_off
+        return 0, 0
+
+    def emit(tok):
+        tokens.append(tok)
+        if len(tokens) == 8:
+            flags = 0
+            blob = bytearray()
+            for k, (lit, b) in enumerate(tokens):
+                if lit:
+                    flags |= 1 << (7 - k)
+                blob += b
+            out.append(flags)
+            out.extend(blob)
+            tokens.clear()
+
+    while i < n:
+        ml, mo = best_match(i)
+        if ml and ml < 12 and i + 1 < n:
+            # lazy match: if the next position matches longer, take a literal
+            ml2, _ = best_match(i + 1)
+            if ml2 > ml:
+                emit((True, bytes((data[i],))))
+                insert(i)
+                i += 1
+                continue
+        if ml:
+            emit((False, bytes(((mo - 1) >> 8, (mo - 1) & 0xFF, ml - 4))))
+            end = i + ml
+            while i < end:
+                insert(i)
+                i += 1
+        else:
+            emit((True, bytes((data[i],))))
+            insert(i)
+            i += 1
+    if tokens:
+        flags = 0
+        blob = bytearray()
+        for k, (lit, b) in enumerate(tokens):
+            if lit:
+                flags |= 1 << (7 - k)
+            blob += b
+        out.append(flags)
+        out += blob
+    return bytes(out)
 
 
-# ---------------- main ----------------
+def lzss_decode(src, total):
+    """Mirror of the firmware LZSS layer (labvid.c lz_byte), for the
+    in-script round-trip gate."""
+    ring = bytearray(65536)
+    out = bytearray()
+    pos = 0
+    sp = 0
+    flags = 0
+    nbits = 0
+    while len(out) < total:
+        if nbits == 0:
+            if sp >= len(src):
+                raise AssertionError("LZSS stream truncated")
+            flags = src[sp]
+            sp += 1
+            nbits = 8
+        bit = flags & 0x80
+        flags = (flags << 1) & 0xFF
+        nbits -= 1
+        if bit:
+            if sp >= len(src):
+                raise AssertionError("LZSS literal truncated")
+            b = src[sp]
+            sp += 1
+            ring[pos & 0xFFFF] = b
+            out.append(b)
+            pos += 1
+        else:
+            if sp + 3 > len(src):
+                raise AssertionError("LZSS match truncated")
+            off = ((src[sp] << 8) | src[sp + 1]) + 1
+            ln = src[sp + 2] + 4
+            sp += 3
+            for k in range(ln):
+                v = ring[(pos - off + k) & 0xFFFF]
+                ring[(pos + k) & 0xFFFF] = v
+                out.append(v)
+            pos += ln
+    if len(out) != total or sp != len(src):
+        raise AssertionError("LZSS decode length mismatch")
+    return bytes(out)
 
-def total_so_far(sizes):
-    return sum(sizes.values()) + 768
 
+# ---------------- derived tables ---------------------------------------
+
+def build_merge2(pal):
+    """64 KiB LUT: merge2[(a<<8)|b] = palette index nearest (L2) to the
+    average of palette colours a and b. Matches players.c expand_merged
+    and is recomputed independently by verify_assets.py."""
+    pal_f = pal.astype(np.float32)
+    a = np.repeat(np.arange(256), 256)
+    b = np.tile(np.arange(256), 256)
+    m = np.empty(65536, np.uint8)
+    for i0 in range(0, 65536, 4096):
+        i1 = i0 + 4096
+        avg = (pal_f[a[i0:i1]] + pal_f[b[i0:i1]]) / 2.0
+        d = ((avg[:, None, :] - pal_f[None, :, :]) ** 2).sum(axis=2)
+        m[i0:i1] = d.argmin(axis=1).astype(np.uint8)
+    return m.tobytes()
+
+
+def build_mbmap(idx_frames):
+    """Per frame 75 B of macroblock dirty bits (block differs from the
+    previous frame; frame 0 all-dirty) — bit (by*30+bx), LSB first,
+    exactly what players.c mb_dirty() reads."""
+    n = len(idx_frames)
+    stride = (30 * 20 + 7) // 8        # 75
+    bits = bytearray(stride * n)
+    for i in range(600):               # frame 0: everything dirty
+        bits[i >> 3] |= 1 << (i & 7)
+    for f in range(1, n):
+        d = idx_frames[f] != idx_frames[f - 1]
+        dirty = d.reshape(20, 16, 30, 16).any(axis=(1, 3))   # (20,30)
+        base = f * stride
+        for by in range(20):
+            row = dirty[by]
+            for bx in range(30):
+                if row[bx]:
+                    i = by * 30 + bx
+                    bits[base + (i >> 3)] |= 1 << (i & 7)
+    hdr = (b"VLM1" + (30).to_bytes(2, "little") + (20).to_bytes(2, "little")
+           + n.to_bytes(2, "little"))
+    return hdr + bytes(bits)
+
+
+# ---------------- main -------------------------------------------------
 
 def main():
+    t0 = time.time()
     OUT.mkdir(parents=True, exist_ok=True)
 
     vf = detect_crop()
-    scan, start = motion_scan(vf)
-    base_rgb = scan[start:start + BASE_FRAMES]
-    nbase = len(base_rgb)
-    print(f"cut: {nbase} frames from scan-frame {start} "
-          f"(t={SCAN_T0 + start / 29.97:.2f}s)")
-    if nbase < BASE_FRAMES:
-        print(f"ERROR: need {BASE_FRAMES} frames, got {nbase}")
-        sys.exit(1)
+    print(f"vf chain: {vf}")
 
-    # global palette from the base cut (every 2nd pixel of every frame)
-    samp = base_rgb[:, ::2, ::2, :].reshape(-1, 3)
+    raw = ffmpeg_raw(["-i", SRC, "-vf", vf, "-r", str(FPS_BAKE),
+                      "-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
+    n = len(raw) // (PANEL_W * PANEL_H * 3)
+    dur = n / FPS_BAKE
+    print(f"decoded {n} frames @ {FPS_BAKE} fps = {dur:.2f} s of content")
+    if not (100 <= n <= 130):
+        print(f"ERROR: expected 100-130 frames, got {n}")
+        sys.exit(1)
+    frames = np.frombuffer(raw, np.uint8).reshape(n, PANEL_H, PANEL_W, 3)
+
+    # global palette over the WHOLE clip (every 2nd pixel)
+    samp = frames[:, ::2, ::2, :].reshape(-1, 3)
     pal = median_cut(samp.copy(), 256)
     pal_f = pal.astype(np.float32)
     (OUT / "palette.pal").write_bytes(pal.tobytes())
-    print(f"palette: 256 colours (RGB666 wire bytes), "
-          f"{(OUT / 'palette.pal').stat().st_size} B")
+    print(f"palette: 256 colours from {len(samp):,} samples "
+          f"({time.time() - t0:.0f}s)")
 
+    # median3 + dither + quantize every frame (the established pipeline)
     cache = {}
-    def quant(fr):
-        # 3x3 median first: kills MPEG-2 codec noise so unchanged image
-        # areas quantize to IDENTICAL indices (the delta techniques depend
-        # on this; same trick as the v7 converter).
+    idx_frames = []
+    err_acc = []
+    for i in range(n):
+        fr = frames[i]
         den = np.stack([median_filter(fr[..., c], size=3, mode="nearest")
                         for c in range(3)], axis=-1)
-        return quantize_with_dither(den.astype(np.float32), pal_f, cache)
-
-    base_idx = [quant(fr) for fr in base_rgb]
-    # quality: decoded palette colour vs the RGB666-quantized original
-    err = np.mean([np.abs(pal[base_idx[i]].astype(np.float32)
-                          - (base_rgb[i].astype(np.float32) / 4).round() * 4)
-                   for i in range(nbase)])
+        qi = quantize_with_dither(den.astype(np.float32), pal_f, cache)
+        idx_frames.append(qi)
+        err_acc.append(np.abs(pal[qi].astype(np.float32)
+                              - (fr.astype(np.float32) / 4).round() * 4).mean())
+        if (i + 1) % 20 == 0:
+            print(f"  quantized {i + 1}/{n} frames ({time.time() - t0:.0f}s)")
+            sys.stdout.flush()
+    err = float(np.mean(err_acc))
     print(f"dither+quantize: mean decode error {err:.2f}/255")
 
-    sizes = {}
-    sizes["base.idx"] = write_idx(OUT / "base.idx", b"VLB1", 480, 320, base_idx)
-    sizes["pre_i4.idx"] = write_pre_i4(OUT / "pre_i4.idx", base_idx[:PREI4_FRAMES])
-    half_idx = [quant(downsample_w(fr, 2)) for fr in base_rgb[:HALF_FRAMES]]
-    sizes["half.idx"] = write_idx(OUT / "half.idx", b"VLB1", 240, 320, half_idx)
-    third_idx = [quant(downsample_w(fr, 3)) for fr in base_rgb[:THIRD_FRAMES]]
-    sizes["third.idx"] = write_idx(OUT / "third.idx", b"VLB1", 160, 320, third_idx)
-    sizes["delta.spans"] = write_spans(OUT / "delta.spans", base_idx[:DELTA_FRAMES],
-                                       pal, budget=BUDGET_ASSETS - total_so_far(sizes))
+    # per-frame RLE -> LZSS, each frame verified as it is built
+    streams = []
+    sizes = []
+    for i, fr in enumerate(idx_frames):
+        rle = rle_frame(fr)
+        lz = lzss_encode(rle)
+        if not lz:
+            print(f"ERROR: frame {i} compressed to nothing")
+            sys.exit(1)
+        dec = lzss_decode(lz, len(rle))
+        if dec != rle:
+            print(f"ERROR: frame {i} LZSS round-trip failed")
+            sys.exit(1)
+        if rle_expand_rows(dec, PANEL_H, PANEL_W) != fr.tobytes():
+            print(f"ERROR: frame {i} RLE expansion mismatch")
+            sys.exit(1)
+        streams.append(lz)
+        sizes.append(len(lz))
+        if (i + 1) % 20 == 0:
+            print(f"  compressed {i + 1}/{n} frames ({time.time() - t0:.0f}s)")
+            sys.stdout.flush()
+    total_idx = n * PANEL_H * PANEL_W
+    total_lz = sum(sizes)
+    print(f"LZSS: {total_idx:,} -> {total_lz:,} B "
+          f"({total_idx / total_lz:.2f}x); per frame "
+          f"min {min(sizes)//1024}K avg {total_lz//n//1024}K "
+          f"max {max(sizes)//1024}K")
 
-    total = sum(sizes.values()) + 768
+    # base.vlb2
+    hdr = (b"VLB2" + PANEL_W.to_bytes(2, "little")
+           + PANEL_H.to_bytes(2, "little") + n.to_bytes(2, "little"))
+    offs = bytearray()
+    acc = 0
+    for s in streams:
+        offs += acc.to_bytes(4, "little")
+        acc += len(s)
+    offs += acc.to_bytes(4, "little")
+    blob = hdr + bytes(offs) + b"".join(streams)
+    (OUT / "base.vlb2").write_bytes(blob)
+
+    # derived tables
+    (OUT / "merge2.bin").write_bytes(build_merge2(pal))
+    (OUT / "mbmap.bin").write_bytes(build_mbmap(idx_frames))
+
+    # ---- re-read from disk and re-verify EVERY frame (firmware walk) ----
+    d = (OUT / "base.vlb2").read_bytes()
+    assert d[:4] == b"VLB2"
+    w = int.from_bytes(d[4:6], "little")
+    h = int.from_bytes(d[6:8], "little")
+    nf = int.from_bytes(d[8:10], "little")
+    assert (w, h, nf) == (PANEL_W, PANEL_H, n)
+    table = 10 + 4 * (nf + 1)
+    prev_off = 0
+    for i in range(nf + 1):
+        o = int.from_bytes(d[10 + 4 * i:14 + 4 * i], "little")
+        assert o >= prev_off, f"offset[{i}] not monotonic"
+        prev_off = o
+    assert prev_off == len(d) - table, "last offset != payload length"
+    for i in range(nf):
+        s, e = (int.from_bytes(d[10 + 4 * i:14 + 4 * i], "little"),
+                int.from_bytes(d[10 + 4 * (i + 1):14 + 4 * (i + 1)], "little"))
+        dec = lzss_decode_strict(d[table + s:table + e])
+        if rle_expand_rows(dec, h, w) != idx_frames[i].tobytes():
+            print(f"ERROR: disk re-verify frame {i} mismatch")
+            sys.exit(1)
+    print(f"disk re-verify: all {nf} frames decode to the exact indices")
+
+    # ---- size report + budget gate ----
+    assets = {
+        "base.vlb2": len(blob),
+        "palette.pal": 768,
+        "merge2.bin": 65536,
+        "mbmap.bin": 10 + 75 * n,
+    }
+    total = sum(assets.values())
     print("\nasset sizes:")
-    for k, v in sizes.items():
+    for k, v in assets.items():
         print(f"  {k:14s} {v:9,d} B  ({v / 1024:.0f} KiB)")
     print(f"  {'TOTAL':14s} {total:9,d} B  (budget {BUDGET_ASSETS:,d})")
     if total > BUDGET_ASSETS:
-        print("OVER BUDGET — shrink the caps and re-run")
+        print("OVER BUDGET — lower FPS_BAKE (9 -> ~6.6 MB) and re-run")
         sys.exit(1)
-    print("\nall assets written to", OUT)
+    print(f"\nall assets written to {OUT} ({time.time() - t0:.0f}s)")
+
+
+def lzss_decode_strict(src):
+    """lzss_decode with the exact output length derived by consuming the
+    stream (used by the disk re-verify pass)."""
+    # walk once to find the output length
+    total = 0
+    sp = 0
+    flags = 0
+    nbits = 0
+    while sp < len(src):
+        if nbits == 0:
+            flags = src[sp]
+            sp += 1
+            nbits = 8
+        bit = flags & 0x80
+        flags = (flags << 1) & 0xFF
+        nbits -= 1
+        if bit:
+            sp += 1
+            total += 1
+        else:
+            sp += 3
+            total += src[sp - 1] + 4
+    return lzss_decode(src, total)
 
 
 if __name__ == "__main__":

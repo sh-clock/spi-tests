@@ -768,3 +768,124 @@ Deliverables: firmware/msp3520-video-lab/ (source + encoder + verifier
 + README, pushed), download/msp3520-video-lab/ (same, cleaned),
 download/msp3520-video-lab-firmware/ (bootloader + partition table +
 app + merged full image + FLASH-INSTRUCTIONS), both zipped.
+
+## 20. (2026-11-16) The FULL clip on internal flash — VLB2 compressed base + runtime derivation
+
+Owner verdict after living with the lab build: "static scanlines look
+pretty good" — techniques 2/3 keep their look byte-for-byte. New
+directive: fit the FULL video (or more of it) in; processing the source
+is allowed; if it cannot be done, an SD card reader gets wired up.
+
+### Measured before deciding (scripts/measure_full.py)
+
+The 20-frame cut cost 6.29 MB because base.idx stored RAW indices
+(153,600 B/frame) — 362 native frames would be 55.6 MB before the
+derived assets even start. What the real content measures like under
+the v6/v7 RLE+LZSS stack (calm window t=2-6 s, burst window t=8.5-12 s,
+per-frame independent, 64 KiB window, median3 + full-clip palette):
+
+  dither   calm avg   burst avg   err        full 29.97 fps   15 fps
+  bayer2   53.8 K     71.2 K      2.35/255   22.12 MB       11.06 MB
+  line8    43.6 K     59.7 K      2.46/255   18.19 MB        9.09 MB
+  none     43.0 K     58.2 K      2.08/255   17.85 MB        8.92 MB
+
+Two structural facts fell out of the same run:
+- per-frame independent vs one sequential stream: 98% — the 64 KiB
+  LZSS window cannot reach back a full 153.6 KiB frame anyway, so
+  cross-frame matching buys almost nothing. Random frame access is
+  essentially free: no keyframes, no rewind-on-loop.
+- 32 KiB window instead of 64: +1.3% asset size, saves 2 x 32 KiB of
+  DRAM (the main ring, static, plus the span technique's heap ring).
+  Taken.
+
+Verdict: NO dither mode fits 29.97 fps (needs ~2.9x more flash than
+the 8 MB chip), and 15 fps misses the ~7.65 MB budget too. 10 fps with
+the CURRENT look (2x2 Bayer) projects to ~7.4 MB and plays essentially
+real-time — the wire only shows ~10.5 full frames/s at 40 MHz anyway.
+DECISION: keep the codec identical (2x2 Bayer + median3 + global
+256-colour palette rebuilt over the whole clip), bake at 10 fps.
+
+### The v2 asset scheme (firmware/msp3520-video-lab)
+
+- base.vlb2 "VLB2": ALL 122 frames (12.2 s at 10 fps = the whole
+  12.045 s source), each frame INDEPENDENTLY RLE->LZSS compressed
+  (2.78x on this content; per frame min 23K / avg 53K / max 86K),
+  u32 offset table after the header for random access. 6,735,381 B.
+- palette.pal: full-clip palette. Mean decode error 2.79/255 — the
+  same number the 20-frame cut got; 256 colours travel well.
+- merge2.bin 64 KiB: merge2[(a<<8)|b] = palette entry nearest to the
+  average of colours a and b. Techniques 11a/11b build their 240/160-
+  wide sources at runtime through it (two LUT steps for 3:1) — the
+  old half.idx/third.idx assets are gone.
+- mbmap.bin "VLM1": per-frame 16x16 macroblock dirty bitmaps (600
+  bits/frame, frame 0 all-dirty) — technique 8 reads the bitmap
+  instead of memcmp-ing two frames in RAM.
+- labvid.c/h (new, pure C99 so it also compiles on the host): the
+  VLB2 decoder = the v6/v7 video.c LZSS layer (struct-ified, 32 KiB
+  ring) + the 1-byte-payload RLE layer, decoding on demand into ONE
+  480x320 DRAM staging frame cached per frame index. Every technique
+  reads the staged frame; the same decoder doubles as the previous-
+  frame row iterator for technique 9 (safe because the staged frame
+  is cached — the ring is free once staging is done).
+- Technique changes (and only these): 9 span delta is computed LIVE
+  (zero-tolerance diff vs the previous frame — tolerance 0 means the
+  panel reconverges to the source every frame, so there is no drift
+  to bound and no canvas to track); 13 reads rows p::4 of the staged
+  frame (same wire shape as the prepacked blob); 8 is mbmap-driven;
+  14's producer stages frames before expanding blocks; blk + pp_blk
+  merged into one shared 2-block pool (players never run concurrently
+  and the producer is done-gated before play_pingpong returns).
+  2/3 scanlines, 1/4/5/6/7/10/11a/11b/12/15: wire-faithful, only the
+  frame source changed (diffed hunk-by-hunk against the 55307db
+  original before building).
+
+### Verification (every gate green before shipping)
+
+- tools/encode_lab.py: per-frame LZSS round-trip + RLE expansion ==
+  the quantized frame; then the whole blob re-read from disk and
+  re-decoded through the firmware walk. In-script, both directions.
+- tools/verify_assets.py: headers, offsets monotonic, all 122 frames
+  decode via the Python mirror, mbmap recomputed bit-for-bit from the
+  decoded frames, merge2 recomputed from the palette (65536 entries),
+  budget gate 6,810,845 / 7,650,000 B.
+- tools/host_test_labvid.py (new): compiles main/labvid.c UNMODIFIED
+  with gcc -Wall -Wextra, decodes the real blob, and compares per-
+  frame FNV-1a hashes against the Python mirror — 122/122 match,
+  combined hash, row-iterator frame-0 identity, bounds + cache
+  re-stage. This gate caught two REAL bugs before they could ship:
+  1. `z->head.ring` vs `z->ring` (a slip while splitting the v6/v7
+     flat state into head + ring — instant compile error, the cheap
+     kind).
+  2. The stream base: blob offsets are relative to the END of the
+     offset table, but the decoder read `blob + off` — so frame 0
+     "decoded" the "VLB2" magic as LZSS (first token: match off
+     19523 = 0x4C42+1 = "LB"). The host trace made it obvious in
+     one run. (The harness itself had a third bug — an aliased
+     staging-buffer hash — also fixed. None of the three could have
+     been caught by the Python-only verifier: that was the point of
+     compiling the device code.)
+- IDF v6.1 build: clean, 7,044,256 B of the 8,323,072 B factory
+  partition (84.6% used). DRAM: 127,199 B of statics leave a 214,561 B
+  heap pool — the 153,600 B staging frame is heap-allocated at boot
+  (first build had it static and the link overflowed dram0_0_seg by
+  64,832 B), leaving ~61 KiB for task stacks and the ping-pong
+  producer/consumer. Getting there needed one more buffer change:
+  play_macro's run[3][23040] (69 KB) was merged into the shared
+  s_blk[2] pool with drain_to(4) — provably safe because one window
+  queues exactly 4 transactions (3 command + 1 data) and TX_RING_SLOTS
+  is 16, so live+queued stays <= 8 <= 16 and drain_to(4) retires the
+  2-back window's transactions before its buffer is refilled (the
+  same arithmetic that makes the row path's 3 buffers + drain_to(8)
+  safe: reuse distance 3 windows = 12 transactions > 8). The
+  technique-9 iterator reuses the main decoder instead of a second
+  heap instance — no interleaving exists in play_spans.
+
+### SD-card verdict (the owner's question)
+
+The FULL video fits — every technique now plays all 12.2 s (122
+frames @ 10 fps, ~real-time on the wire) with the codec look you have
+already seen on the panel. No SD card needed for this clip. What does
+NOT fit on 8 MB flash: full 29.97 fps (17.9-22.1 MB depending on
+dither) or a library of clips (~5.6 MB/min at this quality). When the
+SD reader does get wired, the same VLB2 decoder streams from a file
+unchanged — only the blob source (flash mmap -> FATFS read) moves.

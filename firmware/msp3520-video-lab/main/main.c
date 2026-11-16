@@ -1,20 +1,20 @@
 /*
  * main.c — msp3520-video-lab: a technique testbed for the MSP3520 display.
  *
- * A new test video (INTRO.mkv, DVD rip, 720x480 anamorphic 29.97 fps) was
- * cut, cropped (desqueeze + letterbox + 540-px center crop to 3:2) and
- * encoded by tools/encode_lab.py as 8-bit indexed frames with a global
- * 256-colour RGB666 palette and 2x2 Bayer dithering (6.29 MB of assets,
- * all embedded — the flash layout is the same single-factory-app scheme
- * as the previous projects).
+ * The FULL test video (INTRO.mkv, DVD rip, 720x480 anamorphic 29.97 fps,
+ * 12.045 s) is cropped (desqueeze + letterbox + 540-px-equivalent center
+ * crop to 3:2), sampled at 10 fps and encoded by tools/encode_lab.py as
+ * ONE compressed base asset (VLB2: per-frame RLE + LZSS, 32 KiB window)
+ * of 8-bit indexed frames with a global 256-colour RGB666 palette and 2x2
+ * Bayer dithering. Every technique plays the WHOLE clip, and the derived
+ * sources the old build carried as separate assets (240/160-wide,
+ * pre-interlaced, span deltas) are now computed at runtime from the
+ * staged frames — see players.c.
  *
- * This firmware plays that ONE cut with every technique from the request
- * (interlacing/scanlines/columns/quincunx/deltas/doubling/indexed/pre-
- * interlaced/dual-core), selected from the esp-idf monitor. A technique
- * loops until you press any key, then the menu returns. The 40 MHz SPI
- * clock is the established safe maximum (the S3 GPSPI has no other step
- * between 40 and 80 MHz — see WORKLOG 18); 'c' switches between the real
- * lattice clocks anyway.
+ * A technique loops until you press any key, then the menu returns. The
+ * 40 MHz SPI clock is the established safe maximum (the S3 GPSPI has no
+ * other step between 40 and 80 MHz — see WORKLOG 18); 'c' switches
+ * between the real lattice clocks anyway.
  *
  * The panel is brought up lazily on the first selection, so the menu is
  * reachable even with no display wired (and in QEMU, which stalls on the
@@ -27,6 +27,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/uart.h"
+#include "esp_heap_caps.h"
 
 #include "assets.h"
 #include "players.h"
@@ -86,12 +87,12 @@ static const entry_t s_entries[] = {
     { "7a",  "quincunx (half-width lines)  320 half-rows    230.4 KB", play_quincunx_full },
     { "7b",  "quincunx + 2:1 rows          160 half-rows    115.2 KB", play_quincunx_half },
     { "8",   "macroblock 16x16 delta grid  adaptive         variable", play_macro },
-    { "9",   "span delta (delta.spans)     adaptive         variable", play_spans },
+    { "9",   "span delta (runtime, prev f) adaptive         variable", play_spans },
     { "10",  "LFSR stochastic 4:1          80 random rows   115.2 KB", play_lfsr },
     { "11a", "pixel 2x doubling (240-wide) full frame       460.8 KB", play_double2 },
     { "11b", "pixel 3x doubling (160-wide) full frame       460.8 KB", play_double3 },
     { "12",  "8-bit indexed full frame     256-colour       460.8 KB", play_indexed },
-    { "13",  "pre-interlaced 4:1 pack      80 rows/field    115.2 KB", play_prei4 },
+    { "13",  "pre-interlaced 4:1 rows      80 rows/field    115.2 KB", play_prei4 },
     { "14",  "dual-core ping-pong DMA      full frame       460.8 KB", play_pingpong },
     { "15",  "pure 2:1 row interlace (base)160 rows/field   230.4 KB", play_pure2 },
 };
@@ -100,6 +101,8 @@ static void print_banner(void)
 {
     printf("\n=== msp3520-video-lab — INTRO.mkv technique testbed ===\n");
     printf("40 MHz SPI (safe max; 80 MHz needs 4x-out-of-spec wiring)\n");
+    printf("full 12.0 s clip: %lu frames @ 10 fps, compressed in flash\n",
+           (unsigned long)lab_base_frames());
     printf("technique loops until you press any key\n\n");
     for (size_t i = 0; i < sizeof(s_entries) / sizeof(s_entries[0]); i++) {
         printf("  %-4s  %s\n", s_entries[i].sel, s_entries[i].name);
@@ -147,12 +150,14 @@ void app_main(void)
     for (;;) {
         read_line("select> ", line, sizeof(line));
         if (strcmp(line, "i") == 0) {
-            const lab_idx_t *b = lab_base();
-            printf("base %uf %ux%u  pre-i4 %uf  half %uf  third %uf"
-                   "  delta %uf  palette 256 x RGB666\n",
-                   b->frames, b->w, b->h,
-                   lab_prei4()->frames, lab_half()->frames,
-                   lab_third()->frames, lab_delta()->frames_n);
+            printf("base %lu frames 480x320 (VLB2: RLE+LZSS per frame)"
+                   "  palette 256 x RGB666\n",
+                   (unsigned long)lab_base_frames());
+            printf("merge2 64K index-merge LUT  mbmap %lu frames"
+                   " x 600 dirty bits\n",
+                   (unsigned long)lab_mbmap_frames());
+            printf("heap %lu B free (staging frame allocated at boot)\n",
+                   (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
             continue;
         }
         if (strcmp(line, "c") == 0) {

@@ -1,0 +1,9 @@
+skills/
+node_modules/
+.idf/
+download/
+.idf/
+scripts/__pycache__/
+firmware/msp3520-video-lab/tools/__pycache__/
+firmware/msp3520-video-lab/sdkconfig
+firmware/msp3520-video-lab/managed_components/

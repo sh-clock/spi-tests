@@ -20,14 +20,14 @@ void play_quincunx_half(void);    /* 7b  quincunx + 2:1 rows              */
 
 /* Group 2 — temporal / delta */
 void play_macro(void);            /* 8   macroblock 16x16 delta grid      */
-void play_spans(void);            /* 9   span delta (delta.spans)         */
+void play_spans(void);            /* 9   span delta (runtime, vs prev f)  */
 void play_lfsr(void);             /* 10  LFSR stochastic 4:1              */
 
 /* Group 3 — storage / colour / pipeline */
 void play_double2(void);          /* 11a pixel 2x doubling (240-wide)     */
 void play_double3(void);          /* 11b pixel 3x doubling (160-wide)     */
 void play_indexed(void);          /* 12  8-bit indexed full frame         */
-void play_prei4(void);            /* 13  pre-interlaced 4:1 pack          */
+void play_prei4(void);            /* 13  pre-interlaced 4:1 rows          */
 void play_pingpong(void);         /* 14  dual-core ping-pong DMA          */
 void play_pure2(void);            /* 15  pure 2:1 row interlace (bonus)   */
 

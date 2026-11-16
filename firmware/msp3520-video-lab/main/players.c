@@ -3,6 +3,13 @@
  *
  * Shared machinery:
  *  - lab_lut expands one palette index to 3 ILI9488 RGB666 wire bytes.
+ *  - labvid_stage(f) decodes frame f of the FULL compressed clip into a
+ *    480x320 DRAM staging buffer (cached per frame) — every technique
+ *    reads the staged frame. The old per-technique flash assets are gone:
+ *    what used to be half.idx / third.idx / pre_i4.idx / delta.spans is
+ *    now derived at runtime from the same staged frames (merge-LUT
+ *    decimation for 11a/11b, row reordering for 13, a live zero-tolerance
+ *    diff against the previous frame for 9).
  *  - Row/stripe/span techniques use the driver's queued-window session:
  *    CS stays LOW for the whole field while CASET/PASET/RAMWR commands and
  *    pixel data are queued as DMA transactions (the pre_cb callback flips
@@ -10,8 +17,8 @@
  *    one-row windows carries ~0.8% addressing overhead.
  *  - Full-frame techniques (11/12/14 and the 8-fallback) use the fixed
  *    full-screen window + 16-line block streaming of the v6/v7 players
- *    (1 RAMWR + 20 blocks per field).
- *  - Triple buffers + drain_to(8) keep two bursts in flight while
+ *    (1 RAMWR + 20 blocks per field), one shared 2-block buffer pool.
+ *  - Triple line buffers + drain_to(8) keep two bursts in flight while
  *    guaranteeing a reused buffer's transaction has retired.
  *  - Fields are played back-to-back (bus-limited); the source frame
  *    advances every `ratio` fields. A slower bus = slow-motion content,
@@ -30,30 +37,37 @@
  *     row parity and field parity ((y + field) & 1), a checkerboard that
  *     covers every pixel over two fields without venetian-blind lines.
  *   8 macroblock delta: 30x20 grid of 16x16 blocks; a block is sent when
- *     its index bytes differ from the previous source frame at all (the
- *     encoder's median filter + exact-key dither make static areas
- *     bit-identical, so plain comparison is stable). Dirty blocks are
- *     grouped into horizontal runs, one window per run. Above 66% dirty
- *     the field falls back to one full-frame pass.
- *   9 span delta: plays delta.spans — per-row windows only where the
- *     palette colour actually moved; calm frames are a few KB.
- *   10 LFSR: one permutation of the 320 rows (Fisher-Yates over an
+ *     the encoder's mbmap says its index bytes differ from the previous
+ *     source frame (the bitmap ships as an asset — the player no longer
+ *     needs two frames in RAM). Dirty blocks are grouped into horizontal
+ *     runs, one window per run. Above 66% dirty the field falls back to
+ *     one full-frame pass.
+ *   9 span delta: RUNTIME diff — windows only where the staged frame's
+ *     index differs from the previous frame (tolerance 0, so the panel
+ *     reconverges to the source every frame; no drift to bound). The
+ *     previous frame streams row-by-row through the same decoder (the
+ *     staged frame is cached, so its ring is free). Calm frames are a
+ *     few KB; burst frames collapse to full rows.
+ *   10 LFSR: one permutation of the 320 rows (Fisher-Yates over
  *     xorshift32); each field sends 80 permutation entries, so every row
  *     is refreshed exactly once per 4 fields but in scattered order —
  *     combing becomes film-grain. Re-shuffled every cycle.
- *   11a/b pixel doubling: narrow sources stretched 2x/3x in the DMA
- *     buffer. Same wire bytes as full frame; the test shows the storage
- *     and read-bandwidth saving, not a bus-rate change.
- *   12 indexed full frame: the 256-colour + 2x2 Bayer codec on its own.
- *   13 pre-interlaced: the blob already holds each 80-row field as one
- *     contiguous run — the player streams it with zero source-side row
- *     logic (the wire shape is identical to technique 1; what changes is
- *     that every flash byte read is sent).
- *   14 dual-core ping-pong: core 0 expands blocks into double buffers,
- *     core 1 queues them to SPI — compare its field rate with 12.
+ *   11a/b pixel doubling: the 240/160-wide source is built from the
+ *     staged 480-wide frame through the merge2 LUT (nearest palette entry
+ *     to the average of each 2/3-index group) and stretched 2x/3x in the
+ *     DMA buffer. Same wire bytes as a full frame; the test shows the
+ *     storage trade-off, not a bus-rate change.
+ *   12 indexed full frame: the 256-colour + dither codec on its own.
+ *   13 pre-interlaced: field = rows p, p+4, ... of the staged frame — the
+ *     wire shape is identical to technique 1 and to the old prepacked
+ *     blob; the field rows are walked strictly in order.
+ *   14 dual-core ping-pong: core 0 stages frames and expands blocks into
+ *     double buffers, core 1 queues them to SPI — compare its field rate
+ *     with 12 (which pays the decode serially).
  */
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -62,6 +76,7 @@
 
 #include "players.h"
 #include "assets.h"
+#include "labvid.h"
 #include "msp3520.h"
 
 #define CONSOLE_UART   UART_NUM_0
@@ -194,6 +209,33 @@ static void expand_xN(const uint8_t *idx, uint8_t *dst, int n, int factor)
     }
 }
 
+/* One staged 480-index row, decimated factor:1 through the merge LUT and
+ * stretched back 1:factor — the runtime 240/160-wide source of 11a/11b.
+ * factor 2: merge pairs; factor 3: merge triples (two LUT steps). */
+static void expand_merged(const uint8_t *row, uint8_t *dst, int factor)
+{
+    const uint8_t *m = lab_merge2();
+    const uint8_t (*lut)[3] = lab_lut;
+    if (factor == 2) {
+        for (int x = 0; x < LCD_H_RES / 2; x++) {
+            const uint8_t *p =
+                lut[m[((uint32_t)row[2 * x] << 8) | row[2 * x + 1]]];
+            dst[0] = p[0]; dst[1] = p[1]; dst[2] = p[2];
+            dst[3] = p[0]; dst[4] = p[1]; dst[5] = p[2];
+            dst += 6;
+        }
+    } else {
+        for (int x = 0; x < LCD_H_RES / 3; x++) {
+            uint8_t ab = m[((uint32_t)row[3 * x] << 8) | row[3 * x + 1]];
+            const uint8_t *p = lut[m[((uint32_t)ab << 8) | row[3 * x + 2]]];
+            for (int f = 0; f < 3; f++) {
+                dst[0] = p[0]; dst[1] = p[1]; dst[2] = p[2];
+                dst += 3;
+            }
+        }
+    }
+}
+
 /* Expand one full-height column x of a 480-wide frame (top to bottom). */
 static void expand_column(const uint8_t *frame, int x, uint8_t *dst)
 {
@@ -208,6 +250,11 @@ static void expand_column(const uint8_t *frame, int x, uint8_t *dst)
 }
 
 /* ================= shared field senders ================================ */
+
+/* Shared 2-block DMA pool: field_fullframe() (single-task players) and
+ * the ping-pong producer/consumer (technique 14) never run at the same
+ * time, so one pool serves both. */
+static uint8_t s_blk[2][LCD_BLOCK_BYTES];
 
 /* Send `n` whole rows (physical row == source row) as one CS-low session:
  * one CASET + per-row PASET/RAMWR/data. Triple-buffered. */
@@ -240,11 +287,10 @@ static bool field_rows(const uint8_t *frame, const uint16_t *rows, int n)
 
 /* Full 480x320 field through the fixed-window block path: 1 RAMWR + 20
  * 16-line DMA blocks. `src` is a frame of src_w indexed pixels, stretched
- * `factor` times horizontally (factor 1 = techniques 12/14, 2/3 = 11a/b,
- * and 8's full-frame fallback). */
+ * `factor` times horizontally (factor 1 = techniques 12/14 and 8's
+ * full-frame fallback). */
 static bool field_fullframe(const uint8_t *src, int src_w, int factor)
 {
-    static uint8_t blk[2][LCD_BLOCK_BYTES];
     if (msp3520_prepare_stream() != ESP_OK) {
         return false;
     }
@@ -257,13 +303,48 @@ static bool field_fullframe(const uint8_t *src, int src_w, int factor)
             msp3520_field_end();
             return false;
         }
-        uint8_t *dst = blk[i];
+        uint8_t *dst = s_blk[i];
         for (int l = 0; l < LCD_BLOCK_LINES; l++) {
             expand_xN(src + (size_t)(b * LCD_BLOCK_LINES + l) * src_w,
                       dst, src_w, factor);
             dst += (size_t)LCD_H_RES * 3;
         }
-        if (msp3520_queue_block(blk[i]) != ESP_OK) {
+        if (msp3520_queue_block(s_blk[i]) != ESP_OK) {
+            msp3520_field_end();
+            return false;
+        }
+    }
+    for (int i = 0; i < TX_BLOCKS_IN_FLIGHT; i++) {
+        (void)msp3520_retire_block();
+    }
+    msp3520_field_end();
+    return true;
+}
+
+/* Full 480x320 field built from the STAGED frame decimated factor:1 via
+ * the merge LUT (techniques 11a/11b) — wire-identical to field_fullframe
+ * on a narrow source, but the source rows are derived at runtime. */
+static bool field_fullframe_merged(const uint8_t *frame, int factor)
+{
+    if (msp3520_prepare_stream() != ESP_OK) {
+        return false;
+    }
+    if (msp3520_field_begin() != ESP_OK) {
+        return false;
+    }
+    for (int b = 0; b < FIELD_LINES / LCD_BLOCK_LINES; b++) {
+        int i = b & 1;
+        if (b >= TX_BLOCKS_IN_FLIGHT && msp3520_retire_block() != ESP_OK) {
+            msp3520_field_end();
+            return false;
+        }
+        uint8_t *dst = s_blk[i];
+        for (int l = 0; l < LCD_BLOCK_LINES; l++) {
+            expand_merged(frame + (size_t)(b * LCD_BLOCK_LINES + l) * LCD_H_RES,
+                          dst, factor);
+            dst += (size_t)LCD_H_RES * 3;
+        }
+        if (msp3520_queue_block(s_blk[i]) != ESP_OK) {
             msp3520_field_end();
             return false;
         }
@@ -283,17 +364,21 @@ static void play_row_interlace(const char *name, int ratio)
 {
     pstats_t s;
     uint16_t rows[160];
-    const lab_idx_t *base = lab_base();
+    uint32_t frames = labvid_frames();
     lab_stop_reset();
     ps_begin(&s, name);
     for (uint32_t k = 0; !lab_should_stop(); k++) {
         int p = (int)(k % (uint32_t)ratio);
-        int f = (int)((k / (uint32_t)ratio) % base->frames);
+        uint32_t f = (k / (uint32_t)ratio) % frames;
+        const uint8_t *frame = labvid_stage(f);
+        if (frame == NULL) {
+            break;
+        }
         int n = 0;
         for (int y = p; y < FIELD_LINES; y += ratio) {
             rows[n++] = (uint16_t)y;
         }
-        if (!field_rows(base->data + (size_t)f * 320 * 480, rows, n)) {
+        if (!field_rows(frame, rows, n)) {
             break;
         }
         ps_tick(&s);
@@ -314,7 +399,7 @@ static void play_scan_interlace(const char *name, int ratio)
 {
     pstats_t s;
     uint16_t rows[80];
-    const lab_idx_t *base = lab_base();
+    uint32_t frames = labvid_frames();
     lab_stop_reset();
     if (!lab_panel_ready()) {
         return;
@@ -323,13 +408,17 @@ static void play_scan_interlace(const char *name, int ratio)
     ps_begin(&s, name);
     for (uint32_t k = 0; !lab_should_stop(); k++) {
         int p = (int)(k % (uint32_t)ratio);
-        int f = (int)((k / (uint32_t)ratio) % base->frames);
+        uint32_t f = (k / (uint32_t)ratio) % frames;
+        const uint8_t *frame = labvid_stage(f);
+        if (frame == NULL) {
+            break;
+        }
         int n = 0;
         /* active rows are phys 0,2,4,...; field p takes every ratio-th */
         for (int m = p; m < FIELD_LINES / 2; m += ratio) {
             rows[n++] = (uint16_t)(2 * m);
         }
-        if (!field_rows(base->data + (size_t)f * 320 * 480, rows, n)) {
+        if (!field_rows(frame, rows, n)) {
             break;
         }
         ps_tick(&s);
@@ -346,13 +435,16 @@ void play_col4(void)
 {
     pstats_t s;
     static uint8_t col[3][COL_BYTES];
-    const lab_idx_t *base = lab_base();
+    uint32_t frames = labvid_frames();
     lab_stop_reset();
     ps_begin(&s, "6 col-4:1");
     for (uint32_t k = 0; !lab_should_stop(); k++) {
         int p = (int)(k & 3);
-        int f = (int)((k >> 2) % base->frames);
-        const uint8_t *frame = base->data + (size_t)f * 320 * 480;
+        uint32_t f = (k >> 2) % frames;
+        const uint8_t *frame = labvid_stage(f);
+        if (frame == NULL) {
+            break;
+        }
         int b = 0;
         if (msp3520_session_begin() != ESP_OK
          || msp3520_qpaset(0, FIELD_LINES - 1) != ESP_OK) {
@@ -381,13 +473,16 @@ static void play_quincunx(const char *name, bool half_rows)
 {
     pstats_t s;
     static uint8_t line[3][HALF_BYTES];
-    const lab_idx_t *base = lab_base();
+    uint32_t frames = labvid_frames();
     int ratio = half_rows ? 2 : 1;
     lab_stop_reset();
     ps_begin(&s, name);
     for (uint32_t k = 0; !lab_should_stop(); k++) {
-        int f = (int)((k / (uint32_t)ratio) % base->frames);
-        const uint8_t *frame = base->data + (size_t)f * 320 * 480;
+        uint32_t f = (k / (uint32_t)ratio) % frames;
+        const uint8_t *frame = labvid_stage(f);
+        if (frame == NULL) {
+            break;
+        }
         int b = 0;
         if (msp3520_session_begin() != ESP_OK) {
             break;
@@ -419,15 +514,12 @@ void play_quincunx_half(void) { play_quincunx("7b quincunx+2:1", true); }
 
 /* ================= group 2: delta techniques =========================== */
 
-static bool block_dirty(const uint8_t *fr, const uint8_t *pv, int bx, int by)
+/* Macroblock dirty bit from the encoder's bitmap (VLM1): bit (by*30+bx)
+ * of frame f's 75-byte bitmap = "block differs from frame f-1". */
+static inline bool mb_dirty(const uint8_t *bm, int bx, int by)
 {
-    for (int r = 0; r < MB; r++) {
-        size_t off = (size_t)(by * MB + r) * LCD_H_RES + (size_t)bx * MB;
-        if (memcmp(fr + off, pv + off, MB) != 0) {
-            return true;
-        }
-    }
-    return false;
+    int i = by * MB_COLS + bx;
+    return (bm[i >> 3] >> (i & 7)) & 1;
 }
 
 /* Expand a horizontal run of macroblocks into wire bytes. */
@@ -441,35 +533,35 @@ static void expand_run(const uint8_t *fr, int bx0, int bx1, int by, uint8_t *dst
     }
 }
 
-/* Macroblock delta grid: send only 16x16 blocks whose indices differ from
- * the previous source frame, grouped into runs; fall back to a full frame
- * above 66% dirty. Frame 0 (and every loop wrap) refreshes everything. */
+/* Macroblock delta grid: send only 16x16 blocks whose bitmap bit is set,
+ * grouped into runs; fall back to a full frame above 66% dirty. Frame 0
+ * (and every loop wrap) refreshes everything. */
 void play_macro(void)
 {
     pstats_t s;
-    static uint8_t run[3][LCD_BLOCK_BYTES];
     struct { uint8_t by, bx0, bx1; } runs[MB_ROWS * MB_COLS];
-    const lab_idx_t *base = lab_base();
+    uint32_t frames = labvid_frames();
     lab_stop_reset();
     ps_begin(&s, "8 macroblock");
     for (uint32_t k = 0; !lab_should_stop(); k++) {
-        int f = (int)(k % base->frames);
-        const uint8_t *fr = base->data + (size_t)f * 320 * 480;
-        int prev_f = (f + base->frames - 1) % base->frames;
-        const uint8_t *pv = base->data + (size_t)prev_f * 320 * 480;
+        uint32_t f = k % frames;
+        const uint8_t *fr = labvid_stage(f);
+        if (fr == NULL) {
+            break;
+        }
+        const uint8_t *bm = lab_mbmap() + (size_t)f * ((MB_COLS * MB_ROWS + 7) / 8);
 
         int nruns = 0, dirty = 0;
         if (f != 0) {
             for (int by = 0; by < MB_ROWS; by++) {
                 int bx = 0;
                 while (bx < MB_COLS) {
-                    if (!block_dirty(fr, pv, bx, by)) {
+                    if (!mb_dirty(bm, bx, by)) {
                         bx++;
                         continue;
                     }
                     int bx1 = bx;
-                    while (bx1 + 1 < MB_COLS
-                           && block_dirty(fr, pv, bx1 + 1, by)) {
+                    while (bx1 + 1 < MB_COLS && mb_dirty(bm, bx1 + 1, by)) {
                         bx1++;
                     }
                     runs[nruns].by = (uint8_t)by;
@@ -494,8 +586,14 @@ void play_macro(void)
             break;
         }
         for (int i = 0; i < nruns; i++) {
-            msp3520_drain_to(8);
-            expand_run(fr, runs[i].bx0, runs[i].bx1, runs[i].by, run[b]);
+            /* One window = 4 queued transactions (3 command + 1 data);
+             * TX_RING_SLOTS is 16, so with two buffers live+queued stays
+             * <= 8 <= 16 and drain_to(4) keeps a reused buffer's data
+             * transaction retired before expand_run() touches it — the
+             * same two-deep invariant the row path holds with three
+             * buffers and drain_to(8). */
+            msp3520_drain_to(4);
+            expand_run(fr, runs[i].bx0, runs[i].bx1, runs[i].by, s_blk[b]);
             int x0 = runs[i].bx0 * MB;
             int x1 = (runs[i].bx1 + 1) * MB - 1;
             int y0 = runs[i].by * MB;
@@ -503,11 +601,11 @@ void play_macro(void)
             if (msp3520_qcaset(x0, x1) != ESP_OK
              || msp3520_qpaset(y0, y0 + MB - 1) != ESP_OK
              || msp3520_qramwr() != ESP_OK
-             || msp3520_qdata(run[b], len) != ESP_OK) {
+             || msp3520_qdata(s_blk[b], len) != ESP_OK) {
                 msp3520_session_end();
                 return;
             }
-            b = (b + 1) % 3;
+            b = (b + 1) % 2;
         }
         msp3520_session_end();
         ps_tick(&s);
@@ -515,45 +613,90 @@ void play_macro(void)
     ps_line(&s, true);
 }
 
-/* Span delta: play delta.spans — windows only where the palette colour
- * moved. One sequential pass over the blob per field; frame 0 refreshes. */
+/* Span delta, runtime: windows only where the staged frame's index differs
+ * from the PREVIOUS frame (tolerance 0 — every changed pixel is sent, so
+ * the panel reconverges to the source each frame; nothing can drift).
+ * The previous frame streams row-by-row through the SAME decoder that
+ * staged the current frame — safe because labvid_stage() caches the
+ * staged frame (the decode ring is free once staging is done), and the
+ * two never interleave: stage(f), then rows_begin(f-1) + 320 x
+ * rows_next() reading the cached frame, repeat. Heavily fragmented rows
+ * (> 32 spans or > 92% coverage) collapse to one full-row span, like
+ * the encoder-side asset did. */
 void play_spans(void)
 {
     pstats_t s;
     static uint8_t span[3][ROW_BYTES];
-    const lab_delta_t *delta = lab_delta();
+    static uint8_t prevrow[LCD_H_RES];
+    static struct { uint16_t x0, ln; } spans[LCD_H_RES / 2];
+    uint32_t frames = labvid_frames();
+
     lab_stop_reset();
     ps_begin(&s, "9 span-delta");
-    const uint8_t *cur = delta->frames;
     for (uint32_t k = 0; !lab_should_stop(); k++) {
+        uint32_t f = k % frames;
+        const uint8_t *frame = labvid_stage(f);
+        if (frame == NULL
+         || !labvid_rows_begin((f + frames - 1) % frames)) {
+            break;
+        }
         int b = 0;
         if (msp3520_session_begin() != ESP_OK
          || msp3520_qcaset(0, LCD_H_RES - 1) != ESP_OK) {
             msp3520_session_end();
             break;
         }
-        for (int y = 0; y < FIELD_LINES; y++) {
-            int nspans = *cur++;
-            for (int sp = 0; sp < nspans; sp++) {
-                uint16_t x0 = (uint16_t)(cur[0] | (cur[1] << 8));
-                uint16_t ln = (uint16_t)(cur[2] | (cur[3] << 8));
-                cur += 4;
+        bool ok = true;
+        for (int y = 0; y < FIELD_LINES && ok; y++) {
+            const uint8_t *row = frame + (size_t)y * LCD_H_RES;
+            if (!labvid_rows_next(prevrow)) {
+                break;
+            }
+            int nspans = 0, cover = 0, x = 0;
+            while (x < LCD_H_RES) {
+                if (row[x] == prevrow[x]) {
+                    x++;
+                    continue;
+                }
+                int x0 = x;
+                while (x < LCD_H_RES && row[x] != prevrow[x]) {
+                    x++;
+                }
+                spans[nspans].x0 = (uint16_t)x0;
+                spans[nspans].ln = (uint16_t)(x - x0);
+                cover += x - x0;
+                nspans++;
+            }
+            bool full = nspans > 32 || cover > (LCD_H_RES * 92) / 100;
+            if (full) {
                 msp3520_drain_to(8);
-                expand_xN(cur, span[b], ln, 1);
-                cur += ln;
+                expand_xN(row, span[b], LCD_H_RES, 1);
                 if (msp3520_qpaset(y, y) != ESP_OK
-                 || msp3520_qcaset(x0, x0 + ln - 1) != ESP_OK
                  || msp3520_qramwr() != ESP_OK
-                 || msp3520_qdata(span[b], (size_t)ln * 3) != ESP_OK) {
-                    msp3520_session_end();
-                    return;
+                 || msp3520_qdata(span[b], ROW_BYTES) != ESP_OK) {
+                    ok = false;
+                    break;
                 }
                 b = (b + 1) % 3;
+            } else {
+                for (int sp = 0; sp < nspans; sp++) {
+                    msp3520_drain_to(8);
+                    expand_xN(row + spans[sp].x0, span[b], spans[sp].ln, 1);
+                    if (msp3520_qpaset(y, y) != ESP_OK
+                     || msp3520_qcaset(spans[sp].x0,
+                                       spans[sp].x0 + spans[sp].ln - 1) != ESP_OK
+                     || msp3520_qramwr() != ESP_OK
+                     || msp3520_qdata(span[b], (size_t)spans[sp].ln * 3) != ESP_OK) {
+                        ok = false;
+                        break;
+                    }
+                    b = (b + 1) % 3;
+                }
             }
         }
         msp3520_session_end();
-        if ((k + 1) % delta->frames_n == 0) {
-            cur = delta->frames;               /* loop the blob */
+        if (!ok) {
+            break;
         }
         ps_tick(&s);
     }
@@ -564,24 +707,24 @@ void play_spans(void)
  * xorshift32); field k sends 80 consecutive permutation entries, so all
  * rows refresh exactly once per 4 fields — but scattered, turning combing
  * into film-grain noise. Re-shuffled once per clip cycle. */
-static uint32_t xorshift32(uint32_t *s)
+static uint32_t xorshift32(uint32_t *st)
 {
-    *s ^= *s << 13;
-    *s ^= *s >> 17;
-    *s ^= *s << 5;
-    return *s;
+    *st ^= *st << 13;
+    *st ^= *st >> 17;
+    *st ^= *st << 5;
+    return *st;
 }
 
 void play_lfsr(void)
 {
     pstats_t s;
     static uint16_t perm[FIELD_LINES];
-    const lab_idx_t *base = lab_base();
+    uint32_t frames = labvid_frames();
     uint32_t seed = 0xC0FFEE1u;
     lab_stop_reset();
     ps_begin(&s, "10 lfsr-4:1");
     for (uint32_t k = 0; !lab_should_stop(); k++) {
-        if (k % ((uint32_t)base->frames * 4) == 0) {
+        if (k % ((uint32_t)frames * 4) == 0) {
             for (int i = 0; i < FIELD_LINES; i++) {
                 perm[i] = (uint16_t)i;
             }
@@ -593,9 +736,12 @@ void play_lfsr(void)
             }
         }
         int g = (int)(k & 3);
-        int f = (int)((k >> 2) % base->frames);
-        if (!field_rows(base->data + (size_t)f * 320 * 480,
-                        perm + g * 80, 80)) {
+        uint32_t f = (k >> 2) % frames;
+        const uint8_t *frame = labvid_stage(f);
+        if (frame == NULL) {
+            break;
+        }
+        if (!field_rows(frame, perm + g * 80, 80)) {
             break;
         }
         ps_tick(&s);
@@ -605,18 +751,19 @@ void play_lfsr(void)
 
 /* ================= group 3: storage / colour / pipeline ================ */
 
-/* Pixel doubling: narrow sources stretched to full width in the DMA
- * buffer — identical wire bytes to technique 12, half/third the flash
- * reads. Demonstrates the storage trade-off, not a bus-rate change. */
-static void play_doubled(const char *name, const lab_idx_t *src, int factor)
+/* Pixel doubling: the narrow source is built from the staged frame
+ * through the merge LUT and stretched to full width in the DMA buffer —
+ * identical wire bytes to technique 12; the test shows the storage
+ * trade-off, not a bus-rate change. */
+static void play_doubled(const char *name, int factor)
 {
     pstats_t s;
+    uint32_t frames = labvid_frames();
     lab_stop_reset();
     ps_begin(&s, name);
     for (uint32_t k = 0; !lab_should_stop(); k++) {
-        int f = (int)(k % src->frames);
-        if (!field_fullframe(src->data + (size_t)f * 320 * src->w,
-                             src->w, factor)) {
+        const uint8_t *frame = labvid_stage(k % frames);
+        if (frame == NULL || !field_fullframe_merged(frame, factor)) {
             break;
         }
         ps_tick(&s);
@@ -624,20 +771,19 @@ static void play_doubled(const char *name, const lab_idx_t *src, int factor)
     ps_line(&s, true);
 }
 
-void play_double2(void) { play_doubled("11a double-2x", lab_half(), 2); }
-void play_double3(void) { play_doubled("11b double-3x", lab_third(), 3); }
+void play_double2(void) { play_doubled("11a double-2x", 2); }
+void play_double3(void) { play_doubled("11b double-3x", 3); }
 
-/* Indexed full frame: the 256-colour + 2x2 Bayer codec on its own. */
+/* Indexed full frame: the 256-colour + dither codec on its own. */
 void play_indexed(void)
 {
     pstats_t s;
-    const lab_idx_t *base = lab_base();
+    uint32_t frames = labvid_frames();
     lab_stop_reset();
     ps_begin(&s, "12 indexed");
     for (uint32_t k = 0; !lab_should_stop(); k++) {
-        int f = (int)(k % base->frames);
-        if (!field_fullframe(base->data + (size_t)f * 320 * 480,
-                             LCD_H_RES, 1)) {
+        const uint8_t *frame = labvid_stage(k % frames);
+        if (frame == NULL || !field_fullframe(frame, LCD_H_RES, 1)) {
             break;
         }
         ps_tick(&s);
@@ -645,32 +791,34 @@ void play_indexed(void)
     ps_line(&s, true);
 }
 
-/* Pre-interlaced 4:1 pack: the blob holds each 80-row field contiguous,
- * so the player reads strictly sequentially (zero source-side row logic;
- * the wire shape matches technique 1 exactly). */
+/* Pre-interlaced 4:1: field = rows p, p+4, ... of the staged frame, read
+ * strictly in order — the wire shape is identical to technique 1 (and to
+ * the old prepacked blob: every byte read is sent). */
 void play_prei4(void)
 {
     pstats_t s;
     static uint8_t line[3][ROW_BYTES];
-    const lab_idx_t *pi = lab_prei4();
-    uint32_t fields_total = (uint32_t)pi->frames * pi->phases;
+    uint32_t frames = labvid_frames();
+    uint32_t fields_total = frames * 4;
     lab_stop_reset();
     ps_begin(&s, "13 pre-i4");
     for (uint32_t k = 0; !lab_should_stop(); k++) {
         uint32_t fld = k % fields_total;
-        int phase = (int)(fld % pi->phases);
-        const uint8_t *fd = pi->data
-                          + (size_t)fld * (FIELD_LINES / pi->phases) * pi->w;
+        int phase = (int)(fld & 3);
+        const uint8_t *frame = labvid_stage(fld >> 2);
+        if (frame == NULL) {
+            break;
+        }
         int b = 0;
         if (msp3520_session_begin() != ESP_OK
          || msp3520_qcaset(0, LCD_H_RES - 1) != ESP_OK) {
             msp3520_session_end();
             break;
         }
-        for (int i = 0; i < FIELD_LINES / pi->phases; i++) {
-            int y = phase + i * pi->phases;
+        for (int i = 0; i < FIELD_LINES / 4; i++) {
+            int y = phase + i * 4;
             msp3520_drain_to(8);
-            expand_xN(fd + (size_t)i * pi->w, line[b], pi->w, 1);
+            expand_xN(frame + (size_t)y * LCD_H_RES, line[b], LCD_H_RES, 1);
             if (msp3520_qpaset(y, y) != ESP_OK
              || msp3520_qramwr() != ESP_OK
              || msp3520_qdata(line[b], ROW_BYTES) != ESP_OK) {
@@ -685,20 +833,19 @@ void play_prei4(void)
     ps_line(&s, true);
 }
 
-/* Dual-core ping-pong (technique 14): core 0 expands 16-line blocks into
- * double buffers, core 1 feeds them to the SPI — the same full-frame
- * output as technique 12, so the field-rate difference is pure pipeline.
+/* Dual-core ping-pong (technique 14): core 0 stages frames and expands
+ * 16-line blocks into double buffers, core 1 feeds them to the SPI — the
+ * same full-frame output as technique 12, so the field-rate difference is
+ * pure pipeline (12 pays the frame decode serially, 14 overlaps it).
  *
- * Handshake per block i: producer takes free_[i], fills pp_blk[i], gives
- * ready[i]; consumer takes ready[i], queues pp_blk[i], retires the block
+ * Handshake per block i: producer takes free_[i], fills s_blk[i], gives
+ * ready[i]; consumer takes ready[i], queues s_blk[i], retires the block
  * queued before it, then releases that buffer. Two blocks are in flight
  * mid-field; at a field boundary the last block is retired BEFORE CS goes
  * high. The semaphores and state are static and reused across runs (the
  * producer might outlive play_pingpong() by one 200 ms timeout). */
-uint8_t pp_blk[2][LCD_BLOCK_BYTES];
 
 typedef struct {
-    const lab_idx_t *base;
     volatile bool    stop;
     volatile bool    done;
 } pp_t;
@@ -730,16 +877,19 @@ static void pp_init_once(void)
 static void pp_producer(void *arg)
 {
     pp_t *pp = arg;
+    uint32_t frames = labvid_frames();
     uint32_t k = 0;
     while (!pp->stop) {
-        int f = (int)(k % pp->base->frames);
-        const uint8_t *frame = pp->base->data + (size_t)f * 320 * 480;
+        const uint8_t *frame = labvid_stage(k % frames);
+        if (frame == NULL) {
+            break;
+        }
         for (int b = 0; b < FIELD_LINES / LCD_BLOCK_LINES && !pp->stop; b++) {
             int i = b & 1;
             if (!xSemaphoreTake(pp_free[i], pdMS_TO_TICKS(200))) {
                 continue;
             }
-            uint8_t *dst = pp_blk[i];
+            uint8_t *dst = s_blk[i];
             for (int l = 0; l < LCD_BLOCK_LINES; l++) {
                 expand_xN(frame + (size_t)(b * LCD_BLOCK_LINES + l) * 480,
                           dst, 480, 1);
@@ -770,7 +920,7 @@ static void pp_consumer(void *arg)
         if ((blocks % blocks_per_field) == 0) {
             msp3520_field_begin();
         }
-        msp3520_queue_block(pp_blk[i]);
+        msp3520_queue_block(s_blk[i]);
         outstanding++;
         if ((blocks % blocks_per_field) == blocks_per_field - 1) {
             /* field boundary: retire everything still in flight (FIFO:
@@ -810,7 +960,6 @@ static void pp_consumer(void *arg)
 void play_pingpong(void)
 {
     pp_init_once();
-    pp_state.base = lab_base();
     pp_state.stop = false;
     pp_state.done = false;
     lab_stop_reset();
